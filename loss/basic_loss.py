@@ -10,7 +10,7 @@ from torch import nn
 # import loss.vgg_face as vgg_face
 
 # import torchvision.transforms.functional as TFF
-from src.Face_models.encoders.model_irse import Backbone
+# from src.Face_models.encoders.model_irse import Backbone
 
 # gan loss for patch gan
 def discriminator_loss(real, fake, device):

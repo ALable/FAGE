@@ -21,16 +21,13 @@ from dataset.eth_xgaze import ETHXGazeLMDBDataset
 from dataset.gaze_capture import HDFDataset
 
 from models.gazenet import MLPNetwork
-from models.unet_dic import GazeDiCWrapper
-from models.gaze_dic import GazeInpaitingWrapper
 
 
-import loss.vgg_face as vgg_face
 from loss.vgg_eye import GazePerceptualLoss
 from loss.basic_loss import Interpolate
 from loss.basic_loss import gaze_angular_loss as gaze_angular_error
 from loss.basic_loss import IDLoss
-from loss.discriminator import MultiScaleDiscriminator, DiscriminatorFullModel, PatchGAN
+from loss.discriminator import MultiScaleDiscriminator, PatchGAN
 
 
 def seed_everything(seed):
@@ -275,46 +272,9 @@ def initialize_loss_functions(cfg, accelerator, scheduler_max_steps):
         path=cfg.pretrained.gaze_train_checkpoint_path
         )
 
-    # Get discriminator type from config (default: multi-scale)
-    discriminator_type = getattr(cfg.discriminator_train_params, 'discriminator_type', 'multi-scale')
+    # Get discriminator type from config (default: patchgan)
+    discriminator_type = getattr(cfg.discriminator_train_params, 'discriminator_type', 'patchgan')
     loss_dict['discriminator_type'] = discriminator_type
-    print(f"🎯 Discriminator Type: {discriminator_type.upper()}")
-
-    # Initialize discriminator if GAN loss is enabled
-    if cfg.loss_params.gan_loss > 0:
-        if discriminator_type == 'patchgan':
-            # PatchGAN discriminator
-            print("📦 Initializing PatchGAN discriminator...")
-            loss_dict['discriminator'] = PatchGAN(
-                input_nc=3,
-                ndf=getattr(cfg.discriminator_train_params, 'ndf', 64)
-            ).to(accelerator.device)
-            loss_dict['discriminator_full'] = None  # Not used for PatchGAN
-            loss_dict['disc_scales'] = None  # Not used for PatchGAN
-
-        elif discriminator_type == 'multi-scale':
-            # Multi-Scale discriminator (original)
-            print("📦 Initializing Multi-Scale discriminator...")
-            loss_dict['discriminator'] = MultiScaleDiscriminator(
-                **cfg.model_params.discriminator_params).to(accelerator.device)
-            loss_dict['discriminator_full'] = DiscriminatorFullModel(
-                loss_dict['discriminator'])
-            loss_dict['disc_scales'] = cfg.model_params.discriminator_params.scales
-        else:
-            raise ValueError(f"Unknown discriminator_type: {discriminator_type}. Choose 'patchgan' or 'multi-scale'")
-
-        loss_dict['optimizer_D'] = optim.AdamW(
-            loss_dict['discriminator'].parameters(),
-            lr=cfg.discriminator_train_params.lr,
-            betas=cfg.discriminator_train_params.betas,
-            weight_decay=cfg.discriminator_train_params.weight_decay,
-            eps=cfg.discriminator_train_params.eps
-        )
-        loss_dict['scheduler_D'] = CosineAnnealingLR(
-            loss_dict['optimizer_D'],
-            T_max=scheduler_max_steps,
-            eta_min=cfg.discriminator_train_params.lr * 0.01
-        )
 
     # Initialize eye discriminator if eye GAN loss is enabled
     if cfg.loss_params.eye_gan_loss > 0:
@@ -357,17 +317,17 @@ def initialize_loss_functions(cfg, accelerator, scheduler_max_steps):
     return loss_dict
 
 
-def initialize_vgg(cfg, accelerator):
-    if cfg.loss_params.vgg_loss > 0:
-        vgg_IN = vgg_face.Vgg19().to(accelerator.device)
-        pyramid = vgg_face.ImagePyramide(
-            cfg.loss_params.pyramid_scale, 3).to(accelerator.device)
-        vgg_IN.eval()
-        downsampler = Interpolate(
-            size=(224, 224), mode='bilinear', align_corners=False)
-        return vgg_IN, pyramid, downsampler
-    else:
-        return None, None, None
+# def initialize_vgg(cfg, accelerator):
+#     if cfg.loss_params.vgg_loss > 0:
+#         vgg_IN = vgg_face.Vgg19().to(accelerator.device)
+#         pyramid = vgg_face.ImagePyramide(
+#             cfg.loss_params.pyramid_scale, 3).to(accelerator.device)
+#         vgg_IN.eval()
+#         downsampler = Interpolate(
+#             size=(224, 224), mode='bilinear', align_corners=False)
+#         return vgg_IN, pyramid, downsampler
+#     else:
+#         return None, None, None
 
 
 def prepare_model_input(image, mask, cfg, batch=None):

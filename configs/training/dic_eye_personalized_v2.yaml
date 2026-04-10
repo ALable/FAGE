@@ -1,0 +1,119 @@
+# FAGE Phase 2: Per-User Personalization via SubjectAdapter
+# 基于 Phase 1 预训练权重，只训练 SubjectAdapter (~350K)
+# 新用户: 设置 personalization.phase1_checkpoint → 运行此 config
+model_name: "FAGE"
+exp_name: "FAGE-Personalized-v2"
+output_dir: "/mnt/data/xhy/Logs/FAGE/logs/EyeOnly/v2-personalized"
+resume_from_checkpoint: False
+seed: 42
+
+# Data
+data:
+  dataset_type: "gaze_hdf"
+  hdf_path: "/mnt/data/xhy/eye-concat/GazeCapture_256.h5"
+  train_bs: 8
+  num_workers: 4
+  image_size: 256
+  split_ratio: [0.8, 0.1, 0.1]
+  frame_offset_range: 2
+  eye_crop_size: [64, 64]
+  eye_expand_ratio: 1.5
+  input_eye_crop_size: [80, 80]
+  input_eye_expand_ratio: 2.0
+  # Phase 2 个性化数据配置
+  # personalization_split: 使用哪个 split 的 subjects 作为"新用户"
+  #   "val"  → 使用 val subjects（从未出现在 Phase 1 训练中，标准评测协议）
+  #   "test" → 使用 test subjects（更严格的泛化测试）
+  #   "train"→ 使用 train subjects（验证 SubjectAdapter 对已见用户的改善）
+  personalization_split: "val"
+  # subject_keys: 指定具体用户（null = 使用 personalization_split 的全部用户）
+  # 真实部署场景: subject_keys: ["user_id_A", "user_id_B"]
+  subject_keys: null
+
+# Pretrained gaze estimator (for gaze perceptual loss)
+pretrained:
+  gaze_eval_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadResNet/checkpoints/latest.pth"
+  gaze_train_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadNet/checkpoints/best.pth"
+
+# Loss weights (Phase 2: L1 主导, GAN 关闭减少振荡)
+loss_params:
+  l1_loss: 2.0
+  eye_l1_loss: 4.0
+  vgg_layer_weight: [5, 5, 5, 0, 0]
+  pyramid_scale: [1, 0.5, 0.25]
+  eye_gan_loss: 0.0          # Phase 2 关闭 GAN，避免少数据震荡
+  gaze_perceptual_loss: 0.005
+  start_gaze_perceptual: 100  # Phase 2 更早开启感知损失
+
+# Eye-Only UNet (与 Phase 1 完全一致)
+dic_unet_params:
+  in_channels: 6
+  hidden_size: 32
+  mult_channels: [1, 2, 4, 2, 1]
+  depth: [2, 2, 4, 2, 2]
+  gaze_dim: 64
+  skip_stride: 2
+  affinef: 3
+  actfunc: 'gelu'
+  norm_type: 'gnorm'
+  num_groups: 32
+  min_channels: 4
+  dropout: 0.1
+  blockconfig: 2
+
+# Discriminator (Phase 2 关闭 GAN 时此部分不生效)
+discriminator_train_params:
+  discriminator_type: 'multi-scale'
+  ndf: 64
+  lr: 5.0e-5
+  eps: 0.00000001
+  weight_decay: 0.01
+  betas: [0.5, 0.999]
+  epochs: 10000
+  start_gan: 999999          # 实际上不会触发
+
+model_params:
+  gazenet_params:
+    num_layers: 4
+    num_in: 2
+    num_hidden: 128
+  discriminator_params:
+    scales: [1, 0.5]
+    block_expansion: 32
+    max_features: 256
+    num_blocks: 3
+    sn: True
+    image_channel: 3
+
+# Solver (Phase 2: 小 lr, cosine 衰减, 快速收敛)
+solver:
+  gradient_accumulation_steps: 1
+  mixed_precision: 'no'
+  max_train_steps: 1000
+  max_grad_norm: 1.0
+  learning_rate: 5.0e-5
+  scale_lr: False
+  lr_warmup_steps: 50
+  lr_scheduler: "cosine"
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 1.0e-2  # L2 正则 (替代原 mask 稀疏正则)
+  adam_epsilon: 1.0e-8
+
+# Personalization (Phase 2: SubjectAdapter)
+personalization:
+  enabled: True
+  phase: 2
+  phase1_checkpoint: "/mnt/data/xhy/Logs/FAGE/logs/EyeOnly/4-7/FAGE-EyeOnly-v1/checkpoint-100000.pth"
+
+  # SubjectAdapter 配置
+  subject_adapter:
+    in_channels: 6            # 与 dic_unet_params.in_channels 一致
+    subject_dim: 128          # subject embedding 维度
+
+# Checkpointing
+total_limit: 5
+save_model_epoch_interval: 20000
+checkpointing_steps: 20000
+val_freq: 20000
+val_batch_limit: 4

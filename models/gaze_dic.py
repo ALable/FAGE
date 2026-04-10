@@ -174,12 +174,14 @@ class UNetBlock(nn.Module):
         self.act0 = nn.GELU() if actfunc == 'gelu' else nn.SiLU()
         self.act1 = nn.GELU() if actfunc == 'gelu' else nn.SiLU()
 
-    def forward(self, x, emb, channel_mask=None):
+    def forward(self, x, emb, channel_mask=None, subject_scale=None, subject_shift=None):
         """
         Args:
             x: [B, C_in, H, W]
             emb: [B, emb_channels] stage-specific gaze embedding
-            channel_mask: [B, C_out] 可选，来自 DynamicMaskGenerator (Phase 2)
+            channel_mask: [B, C_out] 可选，向后兼容保留（不推荐使用）
+            subject_scale: [B, C_out, 1, 1] 可选，来自 SubjectAdapter FiLM
+            subject_shift: [B, C_out, 1, 1] 可选，来自 SubjectAdapter FiLM
         """
         orig = x
 
@@ -211,9 +213,14 @@ class UNetBlock(nn.Module):
         skip_input = self.skip(orig) if self.skip is not None else orig
         x = gate * x + (1 - gate) * skip_input
 
-        # 6. 动态通道掩码 (Phase 2 个性化)
+        # 6. 动态通道掩码 (向后兼容)
         if channel_mask is not None:
             x = x * channel_mask.unsqueeze(2).unsqueeze(3)
+
+        # 7. Subject FiLM modulation (主体外观保持，来自 SubjectAdapter)
+        #    x = x * (1 + scale) + shift  — 零初始化时为恒等变换
+        if subject_scale is not None:
+            x = x * (1 + subject_scale) + subject_shift
 
         x = x * self.skip_scale
         return x
@@ -373,24 +380,34 @@ class EyeOnlyGazeDiC(nn.Module):
         # Final layer
         self.final_layer = DiCFinalLayer(channels[4], in_channels, channels[0])
 
-    def forward(self, eye_input, gaze_cond, masks=None):
+    def forward(self, eye_input, gaze_cond, masks=None, subject_mods=None):
         """
         Args:
-            eye_input: [B, 3, 64, 128] 源眼部 crop
-            gaze_cond: [B, 2, gaze_dim] target head+gaze embedding
-            masks: list of [B, C_l] 可选，来自 DynamicMaskGenerator
+            eye_input:     [B, C_in, H, W] 源眼部 crop
+            gaze_cond:     [B, 2, gaze_dim] target head+gaze embedding
+            masks:         list of [B, C_l] 可选，向后兼容（不推荐）
+            subject_mods:  list of (scale, shift) tuples，来自 SubjectAdapter
+                           每个元素 shape [B, C_block, 1, 1]，共 12 个
         Returns:
-            [B, 3, 64, 128] 生成的眼部图像
+            [B, C_in, H, W] 生成的眼部图像
         """
+        block_idx = 0
         mask_idx = 0
 
+        def _sub(idx):
+            """取第 idx 个 block 的 subject FiLM 参数"""
+            if subject_mods is not None:
+                s, sh = subject_mods[idx]
+                return s, sh
+            return None, None
+
         # Patch embed
-        x = self.x_embedder(eye_input)  # [B, C0, 64, 128]
+        x = self.x_embedder(eye_input)  # [B, C0, H, W]
 
         # Stage-specific gaze embeddings
         emb_enc0 = self.gaze_embedder_ls[0](gaze_cond)
         emb_enc1 = self.gaze_embedder_ls[1](gaze_cond)
-        emb_lat = self.gaze_embedder_ls[2](gaze_cond)
+        emb_lat  = self.gaze_embedder_ls[2](gaze_cond)
 
         # Encoder
         skip_features = []
@@ -398,24 +415,30 @@ class EyeOnlyGazeDiC(nn.Module):
         # Enc stage 0
         for block in self.enc_blocks[0]:
             m = masks[mask_idx] if masks else None
-            x = block(x, emb_enc0, channel_mask=m)
+            ss, sh = _sub(block_idx)
+            x = block(x, emb_enc0, channel_mask=m, subject_scale=ss, subject_shift=sh)
             mask_idx += 1
+            block_idx += 1
         skip_features.append(x)
         x = self.downs[0](x)
 
         # Enc stage 1
         for block in self.enc_blocks[1]:
             m = masks[mask_idx] if masks else None
-            x = block(x, emb_enc1, channel_mask=m)
+            ss, sh = _sub(block_idx)
+            x = block(x, emb_enc1, channel_mask=m, subject_scale=ss, subject_shift=sh)
             mask_idx += 1
+            block_idx += 1
         skip_features.append(x)
         x = self.downs[1](x)
 
         # Latent
         for block in self.lat_blocks[0]:
             m = masks[mask_idx] if masks else None
-            x = block(x, emb_lat, channel_mask=m)
+            ss, sh = _sub(block_idx)
+            x = block(x, emb_lat, channel_mask=m, subject_scale=ss, subject_shift=sh)
             mask_idx += 1
+            block_idx += 1
 
         # Decoder
         emb_dec = [emb_enc1, emb_enc0]  # 对称: dec0 用 enc1 的 embedder, dec1 用 enc0
@@ -427,8 +450,10 @@ class EyeOnlyGazeDiC(nn.Module):
             x = torch.cat([x, skip], dim=1)
             for block in self.dec_blocks[i]:
                 m = masks[mask_idx] if masks else None
-                x = block(x, emb_dec[i], channel_mask=m)
+                ss, sh = _sub(block_idx)
+                x = block(x, emb_dec[i], channel_mask=m, subject_scale=ss, subject_shift=sh)
                 mask_idx += 1
+                block_idx += 1
 
         # Final layer
         output = self.final_layer(x, emb_enc0)
@@ -440,8 +465,12 @@ class EyeOnlyWrapper(nn.Module):
 
     训练时: source_eye_crops + target_gaze → generated_eyes (对比 target_eye_crops)
     推理时: source_image + target_gaze → crop眼 → 生成 → paste_eyes 回 source 脸
+
+    Architecture:
+        GazeControlNet (eye_unet):  处理注视控制，Phase 2 后冻结
+        SubjectAdapter:             处理主体外观保持，新用户只更新这部分 (~350K)
     """
-    def __init__(self, unet_config, mask_generator_config=None):
+    def __init__(self, unet_config, subject_adapter_config=None):
         super().__init__()
         self.eye_unet = EyeOnlyGazeDiC(
             in_channels=unet_config.get('in_channels', 3),
@@ -456,16 +485,14 @@ class EyeOnlyWrapper(nn.Module):
             blockconfig=unet_config.get('blockconfig', 2),
         )
 
-        # 可选: mask generator (Phase 2 使用)
-        self.mask_generator = None
-        if mask_generator_config is not None:
-            from models.mask_generator import DynamicMaskGenerator
-            self.mask_generator = DynamicMaskGenerator(
-                gaze_dim=mask_generator_config.get('gaze_dim', 64),
+        # SubjectAdapter: 主体外观保持模块（Phase 2 个性化时只训练此模块）
+        self.subject_adapter = None
+        if subject_adapter_config is not None:
+            from models.subject_adapter import SubjectAdapter
+            self.subject_adapter = SubjectAdapter(
+                in_channels=subject_adapter_config.get('in_channels', 6),
+                subject_dim=subject_adapter_config.get('subject_dim', 128),
                 block_channels=self._get_block_channels(),
-                hidden_dim=mask_generator_config.get('hidden_dim', 128),
-                tau_init=mask_generator_config.get('tau_init', 1.0),
-                tau_min=mask_generator_config.get('tau_min', 0.1),
             )
 
     def _get_block_channels(self):
@@ -482,26 +509,26 @@ class EyeOnlyWrapper(nn.Module):
                 channels.append(block.out_channels)
         return channels
 
-    def forward(self, source_eye_crops, encoder_hidden_states, gaze_cond_flat=None):
+    def forward(self, source_eye_crops, encoder_hidden_states):
         """
         Args:
-            source_eye_crops: [B, 3, 64, 128] 源眼部 crop
-            encoder_hidden_states: [B, 2, gaze_dim] 给 UNet 的条件
-            gaze_cond_flat: [B, gaze_dim] 给 mask generator 的条件 (展平)
+            source_eye_crops:       [B, C_in, H, W] 源眼部 crop
+            encoder_hidden_states:  [B, 2, gaze_dim] 给 UNet 的 gaze 条件
         Returns:
-            generated_eyes: [B, 3, 64, 128]
+            generated_eyes: [B, C_in, H, W]
         """
-        masks = None
-        if self.mask_generator is not None and gaze_cond_flat is not None:
-            masks = self.mask_generator(source_eye_crops, gaze_cond_flat)
+        subject_mods = None
+        if self.subject_adapter is not None:
+            subject_mods = self.subject_adapter(source_eye_crops)
 
-        return self.eye_unet(source_eye_crops, encoder_hidden_states, masks=masks)
+        return self.eye_unet(source_eye_crops, encoder_hidden_states,
+                             subject_mods=subject_mods)
 
     def paste_eyes(self, generated_eyes, source_image, eye_bbox, blend_margin=4):
         """推理时将生成的眼睛贴回原图
 
         Args:
-            generated_eyes: [B, 3, 64, 128] (左64x64 | 右64x64)
+            generated_eyes: [B, 6, 64, 64] (左眼前3通道 | 右眼后3通道)
             source_image: [B, 3, 256, 256] 原始 source 脸
             eye_bbox: [B, 8] 归一化坐标 [lx1,ly1,lx2,ly2, rx1,ry1,rx2,ry2]
             blend_margin: 边缘渐变像素数
@@ -510,8 +537,8 @@ class EyeOnlyWrapper(nn.Module):
         """
         B, _, H, W = source_image.shape
         result = source_image.clone()
-        left_eye = generated_eyes[:, :, :, :64]
-        right_eye = generated_eyes[:, :, :, 64:]
+        left_eye  = generated_eyes[:, :3, :, :]
+        right_eye = generated_eyes[:, 3:, :, :]
 
         for b in range(B):
             for eye_crop, bbox_slice in [(left_eye, slice(0, 4)), (right_eye, slice(4, 8))]:

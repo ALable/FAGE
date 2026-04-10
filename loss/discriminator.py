@@ -165,66 +165,18 @@ class MultiScaleDiscriminator(nn.Module):
         self.discs = nn.ModuleDict(discs)
 
     def forward(self, x):
-        out_dict = {}
-        for scale, disc in self.discs.items():
-            scale = str(scale).replace('-', '.')
-            key = 'prediction_' + scale
-            feature_maps, prediction_map = disc(x[key])
-            out_dict['feature_maps_' + scale] = feature_maps
-            out_dict['prediction_map_' + scale] = prediction_map
-        return out_dict
-
-
-
-class DiscriminatorFullModel(torch.nn.Module):
-    """
-    Merge all discriminator related updates into single model for better multi-gpu usage
-    """
-
-    def __init__(self, discriminator):
-        super(DiscriminatorFullModel, self).__init__()
-        self.discriminator = discriminator
-        self.scales = self.discriminator.scales
-        print("scales",self.scales)
-        self.pyramid = ImagePyramide(self.scales, 3)
-        if torch.cuda.is_available():
-            self.pyramid = self.pyramid.cuda()
-
-        self.zero_tensor = None
-
-    def get_zero_tensor(self, input):
-        if self.zero_tensor is None:
-            self.zero_tensor = torch.FloatTensor(1).fill_(0).cuda()
-            self.zero_tensor.requires_grad_(False)
-        return self.zero_tensor.expand_as(input)
-
-    def forward(self, x, generated, gan_mode='hinge'):
-        pyramide_real = self.pyramid(x)
-        pyramide_generated = self.pyramid(generated.detach())
-
-        discriminator_maps_generated = self.discriminator(pyramide_generated)
-        discriminator_maps_real = self.discriminator(pyramide_real)
-
-        value_total = 0
-        for scale in self.scales:
-            key = 'prediction_map_%s' % scale
-            if gan_mode == 'hinge':
-                value = -torch.mean(torch.min(discriminator_maps_real[key]-1, self.get_zero_tensor(discriminator_maps_real[key]))) - torch.mean(torch.min(-discriminator_maps_generated[key]-1, self.get_zero_tensor(discriminator_maps_generated[key])))
-            elif gan_mode == 'ls':
-                value = ((1 - discriminator_maps_real[key]) ** 2 + discriminator_maps_generated[key] ** 2).mean()
+        """Accept a plain tensor [B, C, H, W], resize per scale internally,
+        return concatenated flattened predictions [B, N_total] for API compatibility."""
+        predictions = []
+        for scale_key, disc in self.discs.items():
+            scale = float(scale_key.replace('-', '.'))
+            if scale != 1.0:
+                x_scaled = F.interpolate(x, scale_factor=scale, mode='bilinear',
+                                         align_corners=False, recompute_scale_factor=True)
             else:
-                raise ValueError('Unexpected gan_mode {}'.format(self.train_params['gan_mode']))
+                x_scaled = x
+            _, prediction_map = disc(x_scaled)          # [B, 1, H', W']
+            predictions.append(prediction_map.flatten(1))  # [B, H'*W']
+        return torch.cat(predictions, dim=1)               # [B, N_total]
 
-            value_total += value
 
-        return value_total
-
-
-def main():
-    discriminator = MultiScaleDiscriminator(scales=[1],
-                                        block_expansion=32,
-                                        max_features=512,
-                                        num_blocks=4,
-                                        sn=True,
-                                        image_channel=3,
-                                        estimate_jacobian=False)

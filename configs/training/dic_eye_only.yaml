@@ -1,8 +1,8 @@
 # FAGE Phase 1: Eye-Only Generation (共享预训练)
 model_name: "FAGE"
 exp_name: "FAGE-EyeOnly-v1"
-output_dir: "/mnt/data/xhy/Logs/FAGE/logs/EyeOnly/v1"
-resume_from_checkpoint: True
+output_dir: "/mnt/data/xhy/Logs/FAGE/logs/EyeOnly/4-9"
+resume_from_checkpoint: False
 seed: 42
 
 # Data
@@ -13,9 +13,11 @@ data:
   num_workers: 6
   image_size: 256
   split_ratio: [0.8, 0.1, 0.1]
-  frame_offset_range: 2
+  frame_offset_range: 4
   eye_crop_size: [64, 64]
   eye_expand_ratio: 1.5
+  input_eye_crop_size: [80, 80]
+  input_eye_expand_ratio: 2.0
 
 # Pretrained gaze estimator (for gaze perceptual loss)
 pretrained:
@@ -26,20 +28,15 @@ pretrained:
 loss_params:
   l1_loss: 2.0
   eye_l1_loss: 4.0
-  vgg_loss: 0.02
-  vgg_mask_loss: 0
-  id_loss_weight: 0
   vgg_layer_weight: [5, 5, 5, 0, 0]
   pyramid_scale: [1, 0.5, 0.25]
-  gan_loss: 0.4
-  fm_loss: [10.0, 10.0, 5, 0]
-  gaze_perceptual_loss: 0.005
-  start_gaze_perceptual: 500
   eye_gan_loss: 0.3
+  gaze_perceptual_loss: 0.01
+  start_gaze_perceptual: 500
 
 # Eye-Only UNet
 dic_unet_params:
-  in_channels: 3
+  in_channels: 6
   hidden_size: 32
   mult_channels: [1, 2, 4, 2, 1]
   depth: [2, 2, 4, 2, 2]
@@ -57,7 +54,7 @@ dic_unet_params:
 discriminator_train_params:
   discriminator_type: 'multi-scale'
   ndf: 64
-  lr: 5.0e-5
+  lr: 1.0e-4
   eps: 0.00000001
   weight_decay: 0.01
   betas: [0.5, 0.999]
@@ -70,7 +67,7 @@ model_params:
     num_in: 2
     num_hidden: 128
   discriminator_params:
-    scales: [1, 0.5]
+    scales: [1]
     block_expansion: 32
     max_features: 256
     num_blocks: 3
@@ -86,7 +83,7 @@ solver:
   learning_rate: 1.0e-4
   scale_lr: False
   lr_warmup_steps: 500
-  lr_scheduler: "linear"
+  lr_scheduler: "cosine"
   adam_beta1: 0.5
   adam_beta2: 0.999
   adam_weight_decay: 1.0e-2

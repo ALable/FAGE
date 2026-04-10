@@ -34,6 +34,8 @@ class HDFDataset(Dataset):
                  frame_offset_range=2,
                  eye_crop_size=(64, 64),
                  eye_expand_ratio=1.5,
+                 input_eye_crop_size=None,
+                 input_eye_expand_ratio=None,
                  transform=None,
                  pick_at_least_per_person=2):
         """
@@ -56,6 +58,9 @@ class HDFDataset(Dataset):
         self.frame_offset_range = frame_offset_range
         self.eye_crop_size = eye_crop_size
         self.eye_expand_ratio = eye_expand_ratio
+        # 模型输入尺寸（比监督尺寸更大，默认与监督相同退化）
+        self.input_eye_crop_size    = input_eye_crop_size   if input_eye_crop_size   is not None else eye_crop_size
+        self.input_eye_expand_ratio = input_eye_expand_ratio if input_eye_expand_ratio is not None else eye_expand_ratio
 
         if transform is None:
             self.to_tensor = transforms.Compose([
@@ -124,20 +129,24 @@ class HDFDataset(Dataset):
         return len(self.index_to_query)
 
     def _crop_eyes(self, image_np, face_parsing):
-        """裁剪左右眼区域并拼接为 [3, crop_h, crop_w*2]
+        """裁剪左右眼，同时返回 input（大范围）和 target（紧范围）两套 crop
 
         Args:
             image_np: [H, W, 3] uint8
             face_parsing: [H, W] uint8 (1=left_eye, 2=right_eye)
 
         Returns:
-            eye_crops: [3, 64, 128] tensor (左眼64x64 | 右眼64x64)
-            eye_bbox: [8] float tensor 归一化坐标 [lx1,ly1,lx2,ly2, rx1,ry1,rx2,ry2]
+            input_tensor:  [6, in_h, in_w]   大范围，模型输入
+            target_tensor: [6, crop_h, crop_w] 紧范围，loss 监督
+            eye_bbox:      [8] float tensor 归一化坐标（基于 tight bbox，用于 paste_eyes）
         """
         H, W = image_np.shape[:2]
         crop_h, crop_w = self.eye_crop_size
-        eye_crops = []
-        bbox_list = []
+        in_h,   in_w   = self.input_eye_crop_size
+
+        input_crops  = []
+        target_crops = []
+        bbox_list    = []
 
         for eye_label in [1, 2]:  # 1=left, 2=right
             eye_mask = (face_parsing == eye_label).astype(np.uint8)
@@ -145,28 +154,41 @@ class HDFDataset(Dataset):
                 points = cv2.findNonZero(eye_mask)
                 if points is not None and len(points) >= 5:
                     (cx, cy), radius = cv2.minEnclosingCircle(points)
-                    r = int(radius * self.eye_expand_ratio)
-                    x1 = max(0, int(cx) - r)
-                    y1 = max(0, int(cy) - r)
-                    x2 = min(W, int(cx) + r)
-                    y2 = min(H, int(cy) + r)
 
-                    crop = image_np[y1:y2, x1:x2]
-                    if crop.size > 0:
-                        crop_resized = cv2.resize(crop, (crop_w, crop_h), interpolation=cv2.INTER_LANCZOS4)
-                        eye_crops.append(crop_resized)
-                        bbox_list.extend([x1/W, y1/H, x2/W, y2/H])
+                    # tight crop（监督用，eye_expand_ratio）
+                    r_t = int(radius * self.eye_expand_ratio)
+                    tx1 = max(0, int(cx) - r_t)
+                    ty1 = max(0, int(cy) - r_t)
+                    tx2 = min(W, int(cx) + r_t)
+                    ty2 = min(H, int(cy) + r_t)
+                    tight_crop = image_np[ty1:ty2, tx1:tx2]
+
+                    # large crop（输入用，input_eye_expand_ratio）
+                    r_i = int(radius * self.input_eye_expand_ratio)
+                    ix1 = max(0, int(cx) - r_i)
+                    iy1 = max(0, int(cy) - r_i)
+                    ix2 = min(W, int(cx) + r_i)
+                    iy2 = min(H, int(cy) + r_i)
+                    large_crop = image_np[iy1:iy2, ix1:ix2]
+
+                    if tight_crop.size > 0 and large_crop.size > 0:
+                        target_crops.append(cv2.resize(tight_crop, (crop_w, crop_h), interpolation=cv2.INTER_LANCZOS4))
+                        input_crops.append( cv2.resize(large_crop, (in_w,   in_h),   interpolation=cv2.INTER_LANCZOS4))
+                        bbox_list.extend([tx1/W, ty1/H, tx2/W, ty2/H])
                         continue
 
-            # fallback: 默认 bbox 和黑色 crop
-            eye_crops.append(np.zeros((crop_h, crop_w, 3), dtype=np.uint8))
+            # fallback
+            target_crops.append(np.zeros((crop_h, crop_w, 3), dtype=np.uint8))
+            input_crops.append( np.zeros((in_h,   in_w,   3), dtype=np.uint8))
             bbox_list.extend([0, 0, 0, 0])
 
-        # 拼接左右眼: [crop_h, crop_w*2, 3]
-        combined = np.concatenate(eye_crops, axis=1)
-        combined_tensor = self.to_tensor(Image.fromarray(combined))  # [3, crop_h, crop_w*2]
-        bbox_tensor = torch.tensor(bbox_list, dtype=torch.float32)
-        return combined_tensor, bbox_tensor
+        # 通道堆叠左右眼
+        input_tensor  = torch.cat([self.to_tensor(Image.fromarray(input_crops[0])),
+                                   self.to_tensor(Image.fromarray(input_crops[1]))],  dim=0)  # [6, in_h, in_w]
+        target_tensor = torch.cat([self.to_tensor(Image.fromarray(target_crops[0])),
+                                   self.to_tensor(Image.fromarray(target_crops[1]))], dim=0)  # [6, crop_h, crop_w]
+        bbox_tensor   = torch.tensor(bbox_list, dtype=torch.float32)
+        return input_tensor, target_tensor, bbox_tensor
 
     def _load_frame(self, key, index):
         """加载单帧数据
@@ -201,15 +223,17 @@ class HDFDataset(Dataset):
 
         Returns:
             dict with:
-                source_image: [3, 256, 256]
-                source_gaze, source_head: [2]
-                source_eye_crops: [3, 64, 128]
-                source_eye_bbox: [8]
-                target_image: [3, 256, 256]
-                target_gaze, target_head: [2]
-                target_eye_crops: [3, 64, 128]
-                target_eye_bbox: [8]
-                subject_idx: int
+                source_image:             [3, H, W]        全脸图像
+                source_gaze, source_head: [2]              注视/头姿角度 (rad)
+                source_input_eye_crops:   [6, in_h, in_w]  大范围眼部 crop，模型输入
+                source_eye_crops:         [6, h, w]        紧范围眼部 crop，GT 备用
+                source_eye_bbox:          [8]              归一化 bbox 坐标 (tight)
+                target_image:             [3, H, W]        全脸图像
+                target_gaze, target_head: [2]              注视/头姿角度 (rad)
+                target_input_eye_crops:   [6, in_h, in_w]  大范围眼部 crop（暂未用）
+                target_eye_crops:         [6, h, w]        紧范围眼部 crop，loss 监督
+                target_eye_bbox:          [8]              归一化 bbox 坐标 (tight)
+                subject_idx:              int              用户编号
         """
         if self.hdf is None:
             self.hdf = h5py.File(self.hdf_path, 'r', libver='latest', swmr=True)
@@ -233,8 +257,8 @@ class HDFDataset(Dataset):
         target_np, target_parsing, target_gaze, target_head = self._load_frame(key, target_index)
 
         # === Eye crops ===
-        source_eye_crops, source_eye_bbox = self._crop_eyes(source_np, source_parsing)
-        target_eye_crops, target_eye_bbox = self._crop_eyes(target_np, target_parsing)
+        src_input, src_target, source_eye_bbox = self._crop_eyes(source_np, source_parsing)
+        tgt_input, tgt_target, target_eye_bbox = self._crop_eyes(target_np, target_parsing)
 
         # === Image tensors ===
         source_image = self.to_tensor(Image.fromarray(source_np))
@@ -247,13 +271,15 @@ class HDFDataset(Dataset):
             'source_image': source_image,
             'source_gaze': torch.from_numpy(source_gaze),
             'source_head': torch.from_numpy(source_head),
-            'source_eye_crops': source_eye_crops,
+            'source_input_eye_crops': src_input,   # [6, in_h, in_w]  大范围，模型输入
+            'source_eye_crops':       src_target,  # [6, h, w]        紧范围，GT（备用）
             'source_eye_bbox': source_eye_bbox,
 
             'target_image': target_image,
             'target_gaze': torch.from_numpy(target_gaze),
             'target_head': torch.from_numpy(target_head),
-            'target_eye_crops': target_eye_crops,
+            'target_input_eye_crops': tgt_input,   # [6, in_h, in_w]  大范围（暂未用）
+            'target_eye_crops':       tgt_target,  # [6, h, w]        紧范围，loss 监督
             'target_eye_bbox': target_eye_bbox,
 
             'subject_idx': subject_idx,
