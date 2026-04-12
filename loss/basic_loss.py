@@ -5,12 +5,7 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 from torch import nn
-# from torch.optim.lr_scheduler import CosineAnnealingLR
-# from loss.discriminator import MultiScaleDiscriminator,DiscriminatorFullModel
-# import loss.vgg_face as vgg_face
-
-# import torchvision.transforms.functional as TFF
-# from src.Face_models.encoders.model_irse import Backbone
+from src.Face_models.encoders.model_irse import Backbone
 
 # gan loss for patch gan
 def discriminator_loss(real, fake, device):
@@ -63,6 +58,20 @@ class IDLoss(nn.Module):
     def forward(self, x):
         x_feats_ms = self.extract_feats(x)
         return x_feats_ms[-1]  # 返回最后一层特征 (512维)
+
+    def loss(self, generated, source):
+        """计算生成脸与源脸的 identity loss (1 - cosine similarity)
+
+        Args:
+            generated: [B, 3, H, W]，生成/贴回的人脸，范围 [-1, 1]
+            source:    [B, 3, H, W]，源人脸（identity 参考），范围 [-1, 1]
+        Returns:
+            scalar: mean(1 - cosine_similarity(feat_gen, feat_src))
+        """
+        feats_gen = self.forward(generated)  # [B, 512]
+        feats_src = self.forward(source)     # [B, 512]
+        cosine_sim = F.cosine_similarity(feats_gen, feats_src, dim=1, eps=1e-6)
+        return (1.0 - cosine_sim).mean()
 
 
 

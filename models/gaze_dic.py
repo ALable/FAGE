@@ -190,9 +190,9 @@ class UNetBlock(nn.Module):
         x = self.conv0(self.act0(x))
 
         # 2. Training noise
-        if self.training:
-            noise = torch.randn(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device)
-            x = x + noise * self.noise_scale
+        # if self.training:
+        #     noise = torch.randn(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device)
+        #     x = x + noise * self.noise_scale
 
         # 3. Affine params from gaze condition
         params = self.affine(emb)
@@ -213,9 +213,9 @@ class UNetBlock(nn.Module):
         skip_input = self.skip(orig) if self.skip is not None else orig
         x = gate * x + (1 - gate) * skip_input
 
-        # 6. 动态通道掩码 (向后兼容)
-        if channel_mask is not None:
-            x = x * channel_mask.unsqueeze(2).unsqueeze(3)
+        # # 6. 动态通道掩码 (向后兼容)
+        # if channel_mask is not None:
+        #     x = x * channel_mask.unsqueeze(2).unsqueeze(3)
 
         # 7. Subject FiLM modulation (主体外观保持，来自 SubjectAdapter)
         #    x = x * (1 + scale) + shift  — 零初始化时为恒等变换
@@ -251,7 +251,7 @@ class Upsample(nn.Module):
 # ==========================================
 
 class EyeOnlyGazeDiC(nn.Module):
-    """轻量级眼部生成 UNet
+    """
     输入: [B, 3, 64, 128] (左眼64x64 | 右眼64x64 横向拼接)
     输出: [B, 3, 64, 128]
 

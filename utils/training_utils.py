@@ -267,10 +267,15 @@ def initialize_loss_functions(cfg, accelerator, scheduler_max_steps):
         'L1_loss': nn.L1Loss()
     }
     if cfg.loss_params.gaze_perceptual_loss > 0:
-        loss_dict["angular_loss"] = GazePerceptualLoss(resize=True, 
-        device=accelerator.device,
-        path=cfg.pretrained.gaze_train_checkpoint_path
+        loss_dict["angular_loss"] = GazePerceptualLoss(resize=True,
+            device=accelerator.device,
+            path=cfg.pretrained.gaze_train_checkpoint_path
         )
+
+    if cfg.loss_params.get('id_loss', 0) > 0:
+        print("🪪 Initializing IDLoss (ArcFace IR-SE50) for identity preservation...")
+        loss_dict['id_loss'] = IDLoss(multiscale=False).to(accelerator.device)
+        loss_dict['id_loss'].eval()
 
     # Get discriminator type from config (default: patchgan)
     discriminator_type = getattr(cfg.discriminator_train_params, 'discriminator_type', 'patchgan')

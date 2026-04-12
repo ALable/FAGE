@@ -1,8 +1,8 @@
 """
-FAGE — Training Script for Eye-Only Gaze Generation
+FAGE — Training Script for Eye-Only Gaze Generation (Phase 1: Shared Pretraining)
 
-Phase 1: Train EyeOnlyGazeDiC on all users (shared model)
-Phase 2: Freeze UNet, train DynamicMaskGenerator per user
+Train GazeControlNet (EyeOnlyGazeDiC + GazeMLP) on all users.
+Per-user SubjectAdapter fine-tuning → see finetune_adapter.py
 """
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "2"
@@ -46,38 +46,8 @@ def seed_everything(seed):
 
 
 def create_model(cfg):
-
     unet_config = OmegaConf.to_container(cfg.dic_unet_params, resolve=True)
-
-    # Phase 2: 带 subject adapter
-    subject_adapter_config = None
-    personalization = getattr(cfg, 'personalization', None)
-    if personalization and personalization.get('enabled', False) and personalization.get('phase', 1) == 2:
-        subject_adapter_config = OmegaConf.to_container(personalization.subject_adapter, resolve=True)
-
-    model = EyeOnlyWrapper(unet_config, subject_adapter_config=subject_adapter_config)
-
-    # Phase 2: 加载 Phase 1 权重并冻结 GazeControlNet (eye_unet)
-    if subject_adapter_config is not None:
-        phase1_ckpt = personalization.get('phase1_checkpoint', None)
-        if phase1_ckpt and os.path.exists(phase1_ckpt):
-            state = torch.load(phase1_ckpt, map_location='cpu')
-            if 'unet_state_dict' in state:
-                model.eye_unet.load_state_dict(state['unet_state_dict'])
-            elif 'model_state_dict' in state:
-                unet_state = {k.replace('eye_unet.', ''): v
-                              for k, v in state['model_state_dict'].items()
-                              if k.startswith('eye_unet.')}
-                if unet_state:
-                    model.eye_unet.load_state_dict(unet_state)
-            logger.info(f"Loaded Phase 1 GazeControlNet from {phase1_ckpt}")
-
-        # 冻结 GazeControlNet
-        for p in model.eye_unet.parameters():
-            p.requires_grad = False
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logger.info(f"Phase 2: GazeControlNet frozen, trainable (SubjectAdapter): {trainable/1e3:.1f}K")
-
+    model = EyeOnlyWrapper(unet_config)
     return model
 
 
@@ -198,8 +168,6 @@ def main(cfg, config_file_path=None):
         seed_everything(cfg.seed + accelerator.process_index)
 
     weight_dtype = torch.float32
-    personalization = getattr(cfg, 'personalization', None)
-    is_phase2 = personalization and personalization.get('enabled', False) and personalization.get('phase', 1) == 2
 
     # === Create model ===
     model = create_model(cfg)
@@ -209,19 +177,8 @@ def main(cfg, config_file_path=None):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Model: {total_params/1e6:.2f}M total, {trainable_params/1e6:.2f}M trainable")
 
-    # Phase 2: gaze_mlp 不参与优化，冻结以避免梯度无端积累（optimizer 不含其参数）
-    if is_phase2:
-        for p in gaze_mlp.parameters():
-            p.requires_grad = False
-        logger.info("Phase 2: gaze_mlp frozen (requires_grad=False)")
-
     # === Optimizer ===
-    if is_phase2:
-        # Phase 2: 只优化 SubjectAdapter（主体外观保持模块）
-        opt_params = [p for p in model.subject_adapter.parameters() if p.requires_grad]
-    else:
-        # Phase 1: 优化所有参数（GazeControlNet + SubjectAdapter + GazeMLP）
-        opt_params = list(model.parameters()) + list(gaze_mlp.parameters())
+    opt_params = list(model.parameters()) + list(gaze_mlp.parameters())
 
     optimizer = torch.optim.AdamW(
         opt_params,
@@ -241,19 +198,6 @@ def main(cfg, config_file_path=None):
     )
 
     # === Dataset ===
-    # Phase 2 个性化: 使用 val subjects (Phase 1 从未见过的新用户) 做 SubjectAdapter fine-tune
-    # Phase 1 共享训练: 使用 train subjects
-    if is_phase2:
-        _p2_split   = cfg.data.get('personalization_split', 'val')   # 默认 val subjects 作新用户
-        _p2_prefixes = list(cfg.data.subject_keys) if cfg.data.get('subject_keys') else None
-        _train_split = _p2_split
-        _val_split   = _p2_split   # Phase 2: train/val 都来自同一批新用户，帧级别不重叠
-        _prefixes    = _p2_prefixes
-    else:
-        _train_split = 'train'
-        _val_split   = 'val'
-        _prefixes    = None
-
     _ds_kwargs = dict(
         split_ratio=cfg.data.split_ratio,
         seed=cfg.seed,
@@ -264,13 +208,8 @@ def main(cfg, config_file_path=None):
         input_eye_expand_ratio=cfg.data.get('input_eye_expand_ratio', None),
     )
 
-    train_dataset = HDFDataset(cfg.data.hdf_path, prefixes=_prefixes, split=_train_split, **_ds_kwargs)
-    val_dataset   = HDFDataset(cfg.data.hdf_path, prefixes=_prefixes, split=_val_split,   **_ds_kwargs)
-
-    if is_phase2:
-        logger.info(f"Phase 2 dataset: split='{_p2_split}', "
-                    f"subjects={train_dataset.num_subjects}, "
-                    f"train_frames={len(train_dataset)}, val_frames={len(val_dataset)}")
+    train_dataset = HDFDataset(cfg.data.hdf_path, split='train', **_ds_kwargs)
+    val_dataset   = HDFDataset(cfg.data.hdf_path, split='val',   **_ds_kwargs)
 
     train_dataloader = DataLoader(
         train_dataset, batch_size=cfg.data.train_bs,
@@ -327,7 +266,6 @@ def main(cfg, config_file_path=None):
         accelerator.init_trackers(cfg.exp_name, init_kwargs={"mlflow": {"run_name": run_time}})
 
     logger.info("***** FAGE Training *****")
-    logger.info(f"Phase: {'2 (Personalization - SubjectAdapter)' if is_phase2 else '1 (Shared)'}")
     logger.info(f"Epochs: {num_train_epochs}, Max steps: {cfg.solver.max_train_steps}")
     logger.info(f"Batch size: {cfg.data.train_bs}, Train samples: {len(train_dataset)}")
 
@@ -338,10 +276,7 @@ def main(cfg, config_file_path=None):
 
     for epoch in range(num_train_epochs):
         model.train()
-        if not is_phase2:
-            gaze_mlp.train()
-        else:
-            gaze_mlp.eval()
+        gaze_mlp.train()
 
         for step, batch in enumerate(train_dataloader):
             if global_step >= cfg.solver.max_train_steps:
@@ -381,12 +316,28 @@ def main(cfg, config_file_path=None):
 
                 # Gaze perceptual loss（贴回原图后，用 GazePerceptualLoss from vgg_eye.py）
                 start_perc = cfg.loss_params.get('start_gaze_perceptual', 500)
+                start_id   = cfg.loss_params.get('start_id_loss', 1000)
                 gaze_perc_loss = None
-                if cfg.loss_params.gaze_perceptual_loss > 0 and global_step >= start_perc:
+                id_loss_val    = None
+
+                # 只要有任意一个 loss 需要 pasted face，就统一计算一次
+                need_pasted = (
+                    (cfg.loss_params.gaze_perceptual_loss > 0 and global_step >= start_perc) or
+                    (cfg.loss_params.get('id_loss', 0) > 0 and global_step >= start_id)
+                )
+                pasted = None
+                if need_pasted:
                     pasted = accelerator.unwrap_model(model).paste_eyes(
                         generated_tight, source_image, source_eye_bbox)
+
+                if cfg.loss_params.gaze_perceptual_loss > 0 and global_step >= start_perc:
                     gaze_perc_loss = loss_dict['angular_loss'](pasted, target_image)
                     loss = loss + cfg.loss_params.gaze_perceptual_loss * gaze_perc_loss
+
+                # ID loss: 贴回脸 与 源脸 保持身份一致
+                if cfg.loss_params.get('id_loss', 0) > 0 and global_step >= start_id:
+                    id_loss_val = loss_dict['id_loss'].loss(pasted, source_image)
+                    loss = loss + cfg.loss_params.id_loss * id_loss_val
 
                 # Eye GAN: Generator step（从 start_gan 步开始）
                 start_gan = cfg.discriminator_train_params.start_gan
@@ -444,6 +395,8 @@ def main(cfg, config_file_path=None):
                 }
                 if gaze_perc_loss is not None:
                     log_dict["train/gaze_perc_loss"] = gaze_perc_loss.item()
+                if id_loss_val is not None:
+                    log_dict["train/id_loss"] = id_loss_val.item()
                 if g_adv is not None:
                     log_dict["train/g_adv_loss"] = g_adv.item()
                     log_dict["train/d_loss"] = d_loss.item()
@@ -559,8 +512,6 @@ def main(cfg, config_file_path=None):
                             'gaze_mlp_state_dict': accelerator.unwrap_model(gaze_mlp).state_dict(),
                             'unet_state_dict': unwrapped_best.eye_unet.state_dict(),
                         }
-                        if is_phase2:
-                            best_save['subject_adapter_state_dict'] = unwrapped_best.subject_adapter.state_dict()
                         torch.save(best_save, best_path)
                         logger.info(
                             f"New best model saved (score={score:.4f}): "
@@ -599,8 +550,7 @@ def main(cfg, config_file_path=None):
                         prefix="val",
                 )
                 model.train()
-                if not is_phase2:
-                    gaze_mlp.train()
+                gaze_mlp.train()
 
             # === 8. Save checkpoint ===
             if global_step % cfg.checkpointing_steps == 0 and accelerator.is_main_process:
@@ -612,10 +562,6 @@ def main(cfg, config_file_path=None):
                     'gaze_mlp_state_dict': accelerator.unwrap_model(gaze_mlp).state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                 }
-                if is_phase2:
-                    # Phase 2: 单独保存 subject_adapter（小文件, 新用户只需更新此部分）
-                    save_dict['subject_adapter_state_dict'] = unwrapped.subject_adapter.state_dict()
-                    save_dict['unet_state_dict'] = unwrapped.eye_unet.state_dict()
 
                 torch.save(save_dict, ckpt_path)
                 logger.info(f"Saved checkpoint: {ckpt_path}")

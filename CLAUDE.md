@@ -8,7 +8,7 @@ Eye-only gaze redirection with per-user personalization. Based on DiC (CVPR 2025
 
 - **Input**: Eye crop [6, 80, 80] (left + right concat, large-range) + target gaze direction
 - **Output**: Generated eye crop [6, 80, 80]，center-crop 到 [6, 64, 64] 与 GT 对比
-- **Personalization**: SubjectAdapter (~346K) FiLM 调制；冻结 GazeControlNet，只更新 SubjectAdapter
+- **Personalization**: Per-user SubjectAdapter (~346K) FiLM 调制；冻结 GazeControlNet，只更新 SubjectAdapter
 
 ## Environment
 
@@ -19,25 +19,30 @@ export PYTHONPATH="${PYTHONPATH}:/home/xuhy/PycharmProjects/FAGE"
 
 Key dependencies: `omegaconf`, `accelerate`, `diffusers` (LR scheduler), `h5py`, `lpips`, `piq`, `cv2`, `torchvision`
 
-## Training
+## Training & Personalization
 
 ```bash
-# Phase 1: 共享预训练（GazeControlNet + SubjectAdapter 全量训练）
+# Phase 1: 共享预训练（GazeControlNet 全量训练）
 python train.py --config configs/training/dic_eye_only.yaml
 
-# Phase 2: 个性化（冻结 GazeControlNet，只训练 SubjectAdapter）
-# 先在 dic_eye_personalized_v2.yaml 中设置 personalization.phase1_checkpoint
-python train.py --config configs/training/dic_eye_personalized_v2.yaml
+# Per-user adapter fine-tune（冻结 GazeControlNet，为每个新用户训练独立 SubjectAdapter）
+# 单个用户
+python finetune_adapter.py --config configs/training/dic_eye_only.yaml \
+    --checkpoint /path/to/phase1.pth --subjects 00002 --max_steps 500
+
+# 批量（所有 val 用户）
+python finetune_adapter.py --config configs/training/dic_eye_only.yaml \
+    --checkpoint /path/to/phase1.pth --split val --max_steps 500
 ```
 
-**Phase 2 数据协议**：使用 val subjects（从未出现在 Phase 1 训练中），验证对新用户的泛化。
+**个性化数据协议**：使用 val subjects（从未出现在 Phase 1 训练中），验证对新用户的泛化。
 
 ## Architecture
 
 ### 双模块设计（明确分离）
 
 ```text
-GazeControlNet (eye_unet, ~2.41M)  ← Phase 2 冻结
+GazeControlNet (eye_unet, ~2.41M)  ← 个性化时冻结
   ├─ GazeMLP (MLPNetwork, ~17K): head/gaze → embedding [B, 64]
   ├─ OverlapPatchEmbed: [B,6,H,W] → [B,32,H,W]
   ├─ ConditionEmbedder × 3: per-stage gaze embedding
@@ -46,7 +51,7 @@ GazeControlNet (eye_unet, ~2.41M)  ← Phase 2 冻结
   │    ② subject: scale/shift from SubjectAdapter (FiLM，零初始化)
   └─ DiCFinalLayer: AdaLN-Zero 输出层
 
-SubjectAdapter (~346K)  ← Phase 2 只训练这部分
+SubjectAdapter (~346K)  ← 每个新用户独立训练
   ├─ SubjectEncoder: [B,6,H,W] → z_s [B,128]
   │    Conv(6→16)→Conv(16→32,s2)→Conv(32→64,s2)→Conv(64→128,s2)→GAP→LN
   └─ BlockModulators × 12: z_s → (scale_i, shift_i) per block
@@ -65,30 +70,30 @@ SubjectAdapter (~346K)  ← Phase 2 只训练这部分
 
 ### 参数量
 
-| 模块           | 参数量  | Phase 1 | Phase 2    |
-|----------------|---------|---------|------------|
-| GazeControlNet | 2.41M   | 训练    | 冻结       |
-| SubjectAdapter | 346K    | 训练    | **只训练** |
-| 合计           | ~2.76M  | 全量    | 346K       |
+| 模块           | 参数量 | Phase 1  | Per-user   |
+|----------------|--------|----------|------------|
+| GazeControlNet | 2.41M  | 训练     | 冻结       |
+| SubjectAdapter | 346K   | -        | **只训练** |
 
 ## Key Files
 
 - `models/gaze_dic.py` — EyeOnlyGazeDiC (UNet), UNetBlock (AdaLN+FiLM), EyeOnlyWrapper
 - `models/subject_adapter.py` — SubjectEncoder, SubjectAdapter (FiLM per-block)
 - `models/gazenet.py` — MLPNetwork: [B,2] → [B, gaze_dim=64]
-- `train.py` — Phase 1 & 2 训练逻辑（数据集、optimizer、checkpoint）
+- `train.py` — Phase 1 共享预训练
+- `finetune_adapter.py` — Per-user SubjectAdapter fine-tune（核心个性化脚本）
+- `inference.py` — 推理（支持 --adapter 加载 per-user 权重）
 - `dataset/gaze_capture.py` — HDFDataset: 配对帧 + 双尺寸眼部 crop
 - `loss/basic_loss.py` — gaze_angular_loss, GAN losses
 - `loss/discriminator.py` — MultiScaleDiscriminator
 - `utils/training_utils.py` — initialize_loss_functions()
 - `configs/training/dic_eye_only.yaml` — Phase 1 config
-- `configs/training/dic_eye_personalized_v2.yaml` — Phase 2 config
 
 ## Key Design
 
-- **Complementary gating**: `sigmoid(gate) * x + (1 - sigmoid(gate)) * skip`（凸组合��输出有界）
+- **Complementary gating**: `sigmoid(gate) * x + (1 - sigmoid(gate)) * skip`（凸组合，输出有界）
 - **AdaLN modulation**: `modulate(x, shift, scale)` 注入 gaze 条件（注视控制）
-- **Subject FiLM**: `x = x * (1 + scale_i) + shift_i`，零初始化，注入主体外观（Phase 1 也训练）
+- **Subject FiLM**: `x = x * (1 + scale_i) + shift_i`，零初始化，注入主体外观
 - **Paired frames**: 源帧提供眼部外观，目标帧提供 gaze 方向 + GT
 - **Two-scale crops**: input [6,80,80] 大范围 → 模型输入；tight [6,64,64] → loss 监督
 
@@ -96,9 +101,22 @@ SubjectAdapter (~346K)  ← Phase 2 只训练这部分
 
 - GazeCapture HDF5: `/mnt/data/xhy/eye-concat/GazeCapture_256.h5`
   - Subject-level split: 80% train (1092 subjects) / 10% val (136 subjects) / 10% test
-  - 配对帧偏移 ±N（Phase 1: ±4，Phase 2: ±2）
-  - **Phase 2 使用 val subjects（新用户，与 Phase 1 无重叠）**
+  - 配对帧偏移 ±N（Phase 1: ±4，Per-user: ±2）
+  - **Per-user fine-tune 使用 val subjects（新用户，与 Phase 1 无重叠）**
 - Phase 1 checkpoint: `/mnt/data/xhy/Logs/FAGE/logs/EyeOnly/4-7/FAGE-EyeOnly-v1/`
+
+## Inference (with per-user adapter)
+
+```bash
+# 无 adapter（baseline）
+python inference.py --config configs/training/dic_eye_only.yaml \
+    --checkpoint /path/to/phase1.pth
+
+# 带 per-user adapter
+python inference.py --config configs/training/dic_eye_only.yaml \
+    --checkpoint /path/to/phase1.pth \
+    --adapter adapter_output/adapters/00002.pth
+```
 
 ## Fast Inference (新用户)
 

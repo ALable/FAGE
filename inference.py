@@ -15,6 +15,23 @@ FAGE Inference — Gaze Redirection on Val Subjects
     # 指定 target gaze（角度）
     python inference.py ... --target_gaze_deg 10.0 -15.0
 """
+"""
+val split
+00003  00034  00104  00130  00145  00192  00310  00331  00358  00491
+00494  00501  00503  00505  00512  00518  00569  00599  00606  00616
+00634  00644  00650  00682  00693  00711  00743  00749  00771  00819
+00875  00961  00997  01000  01002  01060  01065  01084  01100  01107
+01119  01127  01151  01177  01188  01207  01247  01256  01266  01276
+01327  01349  01386  01421  01428  01438  01456  01457  01459  01470
+01473  01486  01487  01496  01532  01546  01584  01627  01710  01713
+01718  01821  01825  01828  01883  01907  01964  02024  02028  02035
+02065  02113  02156  02220  02232  02236  02240  02272  02297  02367
+02370  02394  02450  02474  02478  02534  02540  02673  02729  02761
+02773  02774  02785  02797  02829  02851  02873  02879  02882  02911
+02944  02945  02967  02987  03012  03051  03064  03116  03125  03139
+03140  03177  03185  03190  03232  03248  03251  03253  03259  03266
+03312  03351  03367  03377  03413  0346
+"""
 
 import os
 import sys
@@ -90,9 +107,15 @@ def draw_gaze_arrow(img_np: np.ndarray, pitch: float, yaw: float,
 #  Model loading
 # ──────────────────────────────────────────────
 
-def load_models(cfg, checkpoint_path: str, device: torch.device):
+def load_models(cfg, checkpoint_path: str, device: torch.device, with_adapter: bool = False):
+    """Load Phase 1 model. with_adapter=True creates SubjectAdapter structure (weights loaded later)."""
     unet_config = OmegaConf.to_container(cfg.dic_unet_params, resolve=True)
-    model = EyeOnlyWrapper(unet_config)
+
+    subject_adapter_config = None
+    if with_adapter:
+        subject_adapter_config = {'in_channels': unet_config.get('in_channels', 6), 'subject_dim': 128}
+
+    model = EyeOnlyWrapper(unet_config, subject_adapter_config=subject_adapter_config)
 
     gaze_params = cfg.model_params.gazenet_params
     gaze_dim = cfg.dic_unet_params.get("gaze_dim", 64)
@@ -118,6 +141,7 @@ def load_models(cfg, checkpoint_path: str, device: torch.device):
     else:
         print("  [warn] gaze_mlp weights not found in checkpoint, using random init")
 
+    # Load per-user SubjectAdapter weights (single file mode only; dir mode uses swap_adapter())
     model.to(device).eval()
     gaze_mlp.to(device).eval()
 
@@ -135,6 +159,31 @@ def load_models(cfg, checkpoint_path: str, device: torch.device):
     print(f"  Total          : {all_total:>10,} params")
 
     return model, gaze_mlp
+
+
+def swap_adapter(model, adapter_path: str):
+    """Load adapter weights from file into model.subject_adapter (in-place).
+
+    Returns True on success, False if file not found.
+    """
+    if not os.path.exists(adapter_path):
+        return False
+    adapter_state = torch.load(adapter_path, map_location="cpu")
+    if 'subject_adapter_state_dict' in adapter_state:
+        model.subject_adapter.load_state_dict(adapter_state['subject_adapter_state_dict'])
+    else:
+        model.subject_adapter.load_state_dict(adapter_state)
+    return True
+
+
+def resolve_adapter(adapter_arg: str, subject_key: str):
+    """Given --adapter (file or dir) and subject_key, return the adapter file path or None."""
+    if adapter_arg is None:
+        return None
+    if os.path.isdir(adapter_arg):
+        return os.path.join(adapter_arg, f"{subject_key}.pth")
+    # Single file: use for all subjects
+    return adapter_arg
 
 
 # ──────────────────────────────────────────────
@@ -199,6 +248,38 @@ def run_circle_sweep(model, gaze_mlp, src_batch, head_np, cfg, device,
         pasted_np = draw_gaze_arrow(pasted_np, gaze_np[0], gaze_np[1])
         results.append(pasted_np)
     return results
+
+
+def save_compare_strip(source_np, baseline_np, adapter_np, gt_np, save_path):
+    """保存对比图: source | baseline | +adapter | GT(可选)
+
+    每列下方附带文字标签。
+    """
+    gap = 4
+    _, W = source_np.shape[:2]
+
+    panels = [source_np, baseline_np, adapter_np]
+    labels = ["Source", "Baseline", "+Adapter"]
+    if gt_np is not None:
+        panels.append(gt_np)
+        labels.append("GT")
+
+    import cv2 as _cv2
+    label_h = 24
+    labeled = []
+    for img, lbl in zip(panels, labels):
+        bar = np.full((label_h, W, 3), 240, dtype=np.uint8)
+        _cv2.putText(bar, lbl, (4, 17), _cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 30, 30), 1, _cv2.LINE_AA)
+        labeled.append(np.concatenate([img, bar], axis=0))
+
+    # divider 高度需与拼了标签后的实际列高一致
+    col_h = labeled[0].shape[0]
+    divider = np.full((col_h, gap, 3), 200, dtype=np.uint8)
+    strip = labeled[0]
+    for p in labeled[1:]:
+        strip = np.concatenate([strip, divider, p], axis=1)
+
+    Image.fromarray(strip).save(save_path)
 
 
 # ──────────────────────────────────────────────
@@ -328,6 +409,12 @@ def main():
     parser = argparse.ArgumentParser(description="FAGE Gaze Redirection Inference")
     parser.add_argument("--config",     type=str, required=True,  help="Path to config YAML")
     parser.add_argument("--checkpoint", type=str, required=True,  help="Path to .pth checkpoint")
+    parser.add_argument("--adapter",   type=str, default=None,
+                        help="Path to per-user SubjectAdapter weights (.pth) or directory of adapters")
+    parser.add_argument("--subject",   type=str, default=None,
+                        help="Run inference only for this subject key (auto-derived from --adapter filename if omitted)")
+    parser.add_argument("--compare", action="store_true",
+                        help="Side-by-side comparison: baseline vs +adapter (requires --adapter)")
     parser.add_argument("--output_dir", type=str, default="./inference_results")
     parser.add_argument("--num_samples", type=int, default=6,
                         help="Number of val subjects to randomly sample")
@@ -360,7 +447,20 @@ def main():
     device = torch.device(args.device)
     print(f"Device: {device}")
 
-    model, gaze_mlp = load_models(cfg, args.checkpoint, device)
+    adapter_is_dir = args.adapter is not None and os.path.isdir(args.adapter)
+    use_adapter    = args.adapter is not None
+
+    # 带 SubjectAdapter 结构的主模型（adapter 权重在 subject 循环中换入）
+    model, gaze_mlp = load_models(cfg, args.checkpoint, device, with_adapter=use_adapter)
+
+    # --compare: 同时加载 baseline（无 adapter，用于对比）
+    model_baseline = None
+    if args.compare:
+        if not use_adapter:
+            print("[warn] --compare requires --adapter; running single-model mode")
+        else:
+            model_baseline, _ = load_models(cfg, args.checkpoint, device, with_adapter=False)
+            print("  Comparison mode: baseline vs +adapter per-subject")
 
     # ── FPS benchmark (optional early exit) ──
     if args.benchmark:
@@ -402,12 +502,44 @@ def main():
         fixed_head = np.array(args.target_head, dtype=np.float32)
 
     # ── Sample subjects ───────────────────────
-    chosen = random.sample(subjects, min(args.num_samples, len(subjects)))
+    # 确定目标 subject pool
+    if args.subject:
+        # 显式指定 subject
+        target_subjects = [args.subject]
+    elif not adapter_is_dir and use_adapter:
+        # 单文件模式：从文件名自动推导 subject key（e.g. 00002.pth → 00002）
+        derived = os.path.splitext(os.path.basename(args.adapter))[0]
+        target_subjects = [derived]
+        print(f"  Single adapter file → subject: {derived}")
+    elif adapter_is_dir:
+        # 目录模式：只选有对应权重文件的 subject
+        target_subjects = [s for s in subjects
+                           if os.path.exists(os.path.join(args.adapter, f"{s}.pth"))]
+        print(f"  Adapter dir: {len(target_subjects)}/{len(subjects)} subjects have adapters")
+    else:
+        target_subjects = subjects
+
+    # 检查指定 subject 是否存在于数据集
+    missing = [s for s in target_subjects if s not in val_dataset.prefix_to_indices]
+    if missing:
+        print(f"  [warn] subjects not found in val split: {missing}")
+        target_subjects = [s for s in target_subjects if s in val_dataset.prefix_to_indices]
+
+    chosen = random.sample(target_subjects, min(args.num_samples, len(target_subjects)))
     rows = []
 
     print(f"\nRunning inference on {len(chosen)} subjects...")
     for si, subject in enumerate(chosen):
         subj_indices = val_dataset.prefix_to_indices[subject]
+
+        # 换入该 subject 的 adapter 权重
+        if use_adapter:
+            adapter_file = resolve_adapter(args.adapter, subject)
+            ok = swap_adapter(model, adapter_file)
+            if not ok:
+                print(f"  [{si+1}] {subject}: adapter not found at {adapter_file}, skipping")
+                continue
+            print(f"  [{si+1}/{len(chosen)}] {subject}  adapter={os.path.basename(adapter_file)}")
 
         # Random source frame
         src_idx = random.choice(subj_indices)
@@ -470,6 +602,16 @@ def main():
         Image.fromarray(strip).save(
             os.path.join(args.output_dir, f"{si:02d}_{subj_safe}.png"))
 
+        # --compare: baseline vs +adapter side-by-side
+        if model_baseline is not None:
+            baseline_np, _, _ = run_inference(
+                model_baseline, gaze_mlp, src_batch, tgt_gaze_np, tgt_head_np, cfg, device
+            )
+            baseline_np = draw_gaze_arrow(baseline_np, tgt_gaze_np[0], tgt_gaze_np[1])
+            compare_path = os.path.join(args.output_dir, f"{si:02d}_{subj_safe}_compare.png")
+            save_compare_strip(source_np, baseline_np, pasted_np, gt_np, compare_path)
+            print(f"    compare → {compare_path}")
+
         # Circle sweep: source | gen(θ0) | gen(θ1) | ... | gen(θ7)
         sweep_head = fixed_head if fixed_head is not None else src_batch["source_head"].numpy()
         sweep_imgs = run_circle_sweep(model, gaze_mlp, src_batch, sweep_head, cfg, device)
@@ -481,6 +623,34 @@ def main():
             circle_strip = np.concatenate([circle_strip, divider, s], axis=1)
         Image.fromarray(circle_strip).save(
             os.path.join(args.output_dir, f"{si:02d}_{subj_safe}_circle.png"))
+
+        # --compare circle: baseline vs +adapter two-row circle sweep comparison
+        if model_baseline is not None:
+            baseline_sweep_imgs = run_circle_sweep(
+                model_baseline, gaze_mlp, src_batch, sweep_head, cfg, device)
+
+            label_w = 72
+            H_row = source_np.shape[0]
+            div_v = np.full((H_row, gap, 3), 200, dtype=np.uint8)
+
+            def make_circle_row(label, src_img, imgs):
+                col = np.full((H_row, label_w, 3), 240, dtype=np.uint8)
+                cv2.putText(col, label, (4, H_row // 2 + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (30, 30, 30), 1, cv2.LINE_AA)
+                row = np.concatenate([col, div_v, src_img], axis=1)
+                for img in imgs:
+                    row = np.concatenate([row, div_v, img], axis=1)
+                return row
+
+            row_base = make_circle_row("Baseline", source_np, baseline_sweep_imgs)
+            row_adpt = make_circle_row("+Adapter",  source_np, sweep_imgs)
+            row_div  = np.full((gap, row_base.shape[1], 3), 200, dtype=np.uint8)
+            circle_cmp = np.concatenate([row_base, row_div, row_adpt], axis=0)
+
+            circle_cmp_path = os.path.join(
+                args.output_dir, f"{si:02d}_{subj_safe}_circle_compare.png")
+            Image.fromarray(circle_cmp).save(circle_cmp_path)
+            print(f"    circle_compare → {circle_cmp_path}")
 
     # ── Grid visualization ────────────────────
     grid_path = os.path.join(args.output_dir, "inference_grid.png")
