@@ -1,29 +1,34 @@
 """
-FAGE — SubjectAdapter: Per-User Subject Appearance Preservation
+FAGE — SubjectAdapter: Per-User Subject Appearance Preservation (LoRA version)
 
 Architecture separates two concerns:
   GazeControlNet (shared, ~3M, frozen after Phase 1)
     └─ handles gaze redirection via AdaLN (gaze_emb → scale/shift/gate per UNetBlock)
 
-  SubjectAdapter (per-user, ~350K, fine-tuned per new subject)
+  SubjectAdapter (per-user, ~400K, fine-tuned per new subject)
     ├─ SubjectEncoder:    source_eye → z_s [B, subject_dim]
-    └─ BlockModulators:  z_s → FiLM (scale_i, shift_i) applied in each UNetBlock
+    └─ BlockLoRAHeads × N: z_s → (A, B) low-rank matrices per UNetBlock
+         ΔW = A @ B  (rank-r decomposition of conv1 weight perturbation)
 
-FiLM injection (applied AFTER gaze gate-residual in each UNetBlock):
-    x_out = x_gaze * (1 + scale_i) + shift_i
+LoRA injection (applied inside each UNetBlock.conv1):
+    W_eff = W_frozen + A @ B          (ΔW zero-init → identity at start)
+    out   = F.conv2d(x, W_eff, ...)
 
 Design properties:
   - SubjectAdapter input: source eye ONLY (no gaze) → pure appearance
-  - Zero-init BlockModulators → identity at init (stable Phase 1 → 2 transfer)
-  - Encode reference frames once per subject, cache modulations → fast inference
+  - Zero-init B matrices → ΔW=0 at init (stable Phase 1 → 2 transfer)
+  - Encode reference frames once per subject, cache LoRA deltas → fast inference
+  - More expressive than FiLM: modifies the feature transformation itself,
+    not just per-channel scale/shift
 
 Fast inference for new subjects:
     z_s    = adapter.encode(ref_frames).mean(0, keepdim=True)  # run once
-    cached = adapter.get_modulations(z_s)                      # run once
+    cached = adapter.get_lora_deltas(z_s)                      # run once
     out    = unet(eye, gaze_cond, subject_mods=cached)         # per-frame
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class SubjectEncoder(nn.Module):
@@ -56,28 +61,71 @@ class SubjectEncoder(nn.Module):
         return self.net(source_eye)
 
 
-class SubjectAdapter(nn.Module):
-    """Per-user subject appearance adapter (~350K params).
+class BlockLoRAHead(nn.Module):
+    """Per-block LoRA head: shared_hidden → (A, B) for one UNetBlock's conv1.
 
-    Generates per-block FiLM modulations from source eye appearance.
-    These modulate GazeControlNet's UNet blocks to preserve subject-specific
-    appearance while gaze direction is controlled independently by gaze_emb.
+    Takes pre-computed shared hidden features (from SubjectAdapter.shared_trunk),
+    outputs ΔW = A @ B for conv1 weight perturbation.
+
+    conv1 weight shape: [C_out, C_in, k, k]
+    LoRA:  A [C_out, rank] @ B [rank, C_in*k*k]  → ΔW [C_out, C_in, k, k]
+    Zero-init B → ΔW=0 at initialization.
+    """
+    def __init__(self, hidden_dim: int, c_out: int, c_in: int, k: int = 3, rank: int = 4):
+        super().__init__()
+        self.c_out = c_out
+        self.c_in = c_in
+        self.k = k
+        self.rank = rank
+
+        self.head_A = nn.Linear(hidden_dim, c_out * rank, bias=True)
+        self.head_B = nn.Linear(hidden_dim, rank * c_in * k * k, bias=True)
+
+        nn.init.zeros_(self.head_B.weight)
+        nn.init.zeros_(self.head_B.bias)
+        nn.init.normal_(self.head_A.weight, std=0.02)
+        nn.init.zeros_(self.head_A.bias)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h: [B, hidden_dim]  shared trunk features
+        Returns:
+            delta_W: [B, C_out, C_in, k, k]
+        """
+        B = h.shape[0]
+        A = self.head_A(h).view(B, self.c_out, self.rank)
+        Bm = self.head_B(h).view(B, self.rank, self.c_in * self.k * self.k)
+        return torch.bmm(A, Bm).view(B, self.c_out, self.c_in, self.k, self.k)
+
+
+class SubjectAdapter(nn.Module):
+    """Per-user subject appearance adapter using dynamic LoRA (~400K params).
+
+    Generates per-block LoRA weight deltas from source eye appearance.
+    These are applied to GazeControlNet's UNetBlock.conv1 weights to preserve
+    subject-specific appearance while gaze direction is controlled independently.
+
+    vs FiLM: LoRA modifies the feature transformation itself (ΔW on conv weights),
+    enabling finer-grained appearance control (iris texture, eyelash detail, etc.)
+    rather than just per-channel scale/shift.
 
     Training:
         Phase 1: Trained jointly with GazeControlNet (all params trainable)
         Phase 2: Only SubjectAdapter fine-tuned for new users (300-1000 steps)
 
     Inference:
-        Fast path — encode reference frames once, cache modulations:
-            z_s    = adapter.encode(ref_eye)        # [1, subject_dim]
-            cached = adapter.get_modulations(z_s)   # list of 12 (scale, shift)
-            out    = unet(eye, gaze, subject_mods=cached)  # no adapter call
+        Fast path — encode reference frames once, cache LoRA deltas:
+            z_s    = adapter.encode(ref_eye)          # [1, subject_dim]
+            cached = adapter.get_lora_deltas(z_s)     # list of N delta_W
+            out    = unet(eye, gaze, subject_mods=cached)
     """
     def __init__(
         self,
         in_channels: int = 6,
         subject_dim: int = 128,
         block_channels=None,
+        lora_rank: int = 4,
     ):
         """
         Args:
@@ -86,9 +134,11 @@ class SubjectAdapter(nn.Module):
             block_channels: list[int], out_channels per UNetBlock in traversal order
                             (enc0 → enc1 → latent → dec0 → dec1).
                             Default matches EyeOnlyGazeDiC depth=[2,2,4,2,2], hidden=32.
+            lora_rank:      rank r for LoRA decomposition (default 4)
         """
         super().__init__()
         self.subject_dim = subject_dim
+        self.lora_rank = lora_rank
 
         if block_channels is None:
             # EyeOnlyGazeDiC: depth=[2,2,4,2,2], mult=[1,2,4,2,1], hidden_size=32
@@ -97,18 +147,30 @@ class SubjectAdapter(nn.Module):
         # ── Appearance encoder ──────────────────────────────────────────────
         self.encoder = SubjectEncoder(in_channels, subject_dim)
 
-        # ── Per-block FiLM heads ────────────────────────────────────────────
-        # Each: z_s → (scale, shift) ∈ R^{C_block}
-        # Zero-init → identity transformation at start
-        self.block_modulators = nn.ModuleList()
+        # ── Shared trunk: z_s → shared hidden features ──────────────────────
+        # All block heads share this trunk to reduce param count
+        self.trunk_hidden = max(subject_dim // 2, 32)
+        self.shared_trunk = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(subject_dim, self.trunk_hidden, bias=True),
+            nn.SiLU(),
+        )
+
+        # ── Per-block LoRA heads ────────────────────────────────────────────
+        # conv1 in each UNetBlock: [C_out, C_out, 3, 3]  (same in/out after conv0)
+        # We target conv1 (post-norm, post-gaze-modulation conv)
+        # Rank scales with channel count to keep param budget reasonable:
+        #   ch=32  → rank=lora_rank      (e.g. 4)
+        #   ch=64  → rank=lora_rank//2   (e.g. 2)
+        #   ch=128 → rank=max(1, lora_rank//4)  (e.g. 1)
+        self.block_lora_heads = nn.ModuleList()
+        base_ch = min(block_channels)
         for ch in block_channels:
-            head = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(subject_dim, ch * 2, bias=True),
+            scale = ch // base_ch          # 1, 2, or 4
+            rank = max(1, lora_rank // scale)
+            self.block_lora_heads.append(
+                BlockLoRAHead(self.trunk_hidden, c_out=ch, c_in=ch, k=3, rank=rank)
             )
-            nn.init.zeros_(head[-1].weight)
-            nn.init.zeros_(head[-1].bias)
-            self.block_modulators.append(head)
 
     # ── API ─────────────────────────────────────────────────────────────────
 
@@ -125,35 +187,28 @@ class SubjectAdapter(nn.Module):
         """
         return self.encoder(source_eye)
 
-    def get_modulations(self, subject_emb: torch.Tensor):
-        """Generate per-block FiLM (scale, shift) from subject embedding.
+    def get_lora_deltas(self, subject_emb: torch.Tensor):
+        """Generate per-block LoRA weight deltas from subject embedding.
 
         Result can be cached when subject_emb is fixed (e.g., per-user inference).
 
         Args:
             subject_emb: [B, subject_dim]
         Returns:
-            mods: list of (scale, shift) tuples, each shaped [B, C_block, 1, 1]
+            deltas: list of delta_W tensors, each [B, C_out, C_in, k, k]
         """
-        mods = []
-        for head in self.block_modulators:
-            params = head(subject_emb)                       # [B, 2×C]
-            scale, shift = params.chunk(2, dim=1)
-            mods.append((
-                scale.unsqueeze(-1).unsqueeze(-1),           # [B, C, 1, 1]
-                shift.unsqueeze(-1).unsqueeze(-1),
-            ))
-        return mods
+        h = self.shared_trunk(subject_emb)   # [B, trunk_hidden]
+        return [head(h) for head in self.block_lora_heads]
 
     def forward(self, source_eye: torch.Tensor):
-        """Encode source eye and return per-block FiLM modulations.
+        """Encode source eye and return per-block LoRA deltas.
 
         Args:
             source_eye: [B, C_in, H, W]
         Returns:
-            mods: list of (scale, shift) tuples, each [B, C_block, 1, 1]
+            deltas: list of delta_W tensors, each [B, C_out, C_in, k, k]
         """
-        return self.get_modulations(self.encode(source_eye))
+        return self.get_lora_deltas(self.encode(source_eye))
 
     @property
     def num_params(self) -> int:

@@ -174,14 +174,14 @@ class UNetBlock(nn.Module):
         self.act0 = nn.GELU() if actfunc == 'gelu' else nn.SiLU()
         self.act1 = nn.GELU() if actfunc == 'gelu' else nn.SiLU()
 
-    def forward(self, x, emb, channel_mask=None, subject_scale=None, subject_shift=None):
+    def forward(self, x, emb, channel_mask=None, subject_lora=None):
         """
         Args:
             x: [B, C_in, H, W]
             emb: [B, emb_channels] stage-specific gaze embedding
-            channel_mask: [B, C_out] 可选，向后兼容保留（不推荐使用）
-            subject_scale: [B, C_out, 1, 1] 可选，来自 SubjectAdapter FiLM
-            subject_shift: [B, C_out, 1, 1] 可选，来自 SubjectAdapter FiLM
+            channel_mask: unused, kept for backward compat
+            subject_lora: [B, C_out, C_out, 3, 3] optional LoRA delta_W for conv1,
+                          from SubjectAdapter. Applied as W_eff = W + delta_W (per-sample).
         """
         orig = x
 
@@ -189,12 +189,7 @@ class UNetBlock(nn.Module):
         x = self.norm0(x)
         x = self.conv0(self.act0(x))
 
-        # 2. Training noise
-        # if self.training:
-        #     noise = torch.randn(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device)
-        #     x = x + noise * self.noise_scale
-
-        # 3. Affine params from gaze condition
+        # 2. Affine params from gaze condition
         params = self.affine(emb)
 
         if self.affinef == 3:
@@ -204,23 +199,36 @@ class UNetBlock(nn.Module):
             scale, shift = params.chunk(2, dim=1)
             gate = 1
 
-        # 4. Modulate + Conv1
+        # 3. Modulate + Conv1 (with optional LoRA delta)
         x = self.act1(modulate(self.norm1(x), shift, scale))
-        x = self.conv1(F.dropout(x, p=self.dropout, training=self.training))
+        x = F.dropout(x, p=self.dropout, training=self.training)
 
-        # 5. 互补门控残差连接 (凸组合，输出有界)
+        if subject_lora is not None:
+            # Per-sample LoRA: W_eff[b] = W + delta_W[b]
+            # Batched via grouped conv trick:
+            #   reshape x → [1, B*C, H, W], weight → [B*C_out, C_in, k, k] with groups=B
+            B, C, H, W = x.shape
+            C_out = self.conv1.out_channels
+            k = self.conv1.kernel_size[0]
+            pad = self.conv1.padding[0]
+
+            # Base weight broadcast: [C_out, C_in, k, k] → [B, C_out, C_in, k, k]
+            W_base = self.conv1.weight.unsqueeze(0).expand(B, -1, -1, -1, -1)
+            W_eff = (W_base + subject_lora).reshape(B * C_out, C, k, k)
+
+            x_grouped = x.reshape(1, B * C, H, W)
+            bias = self.conv1.bias
+            if bias is not None:
+                bias = bias.repeat(B)
+            x = F.conv2d(x_grouped, W_eff, bias=bias, padding=pad, groups=B)
+            x = x.reshape(B, C_out, x.shape[2], x.shape[3])
+        else:
+            x = self.conv1(x)
+
+        # 4. 互补门控残差连接 (凸组合，输出有界)
         gate = torch.sigmoid(gate)
         skip_input = self.skip(orig) if self.skip is not None else orig
         x = gate * x + (1 - gate) * skip_input
-
-        # # 6. 动态通道掩码 (向后兼容)
-        # if channel_mask is not None:
-        #     x = x * channel_mask.unsqueeze(2).unsqueeze(3)
-
-        # 7. Subject FiLM modulation (主体外观保持，来自 SubjectAdapter)
-        #    x = x * (1 + scale) + shift  — 零初始化时为恒等变换
-        if subject_scale is not None:
-            x = x * (1 + subject_scale) + subject_shift
 
         x = x * self.skip_scale
         return x
@@ -385,21 +393,16 @@ class EyeOnlyGazeDiC(nn.Module):
         Args:
             eye_input:     [B, C_in, H, W] 源眼部 crop
             gaze_cond:     [B, 2, gaze_dim] target head+gaze embedding
-            masks:         list of [B, C_l] 可选，向后兼容（不推荐）
-            subject_mods:  list of (scale, shift) tuples，来自 SubjectAdapter
-                           每个元素 shape [B, C_block, 1, 1]，共 12 个
+            masks:         unused, kept for backward compat
+            subject_mods:  list of delta_W tensors from SubjectAdapter (LoRA),
+                           each [B, C_out, C_out, 3, 3], length = num_blocks (12)
         Returns:
             [B, C_in, H, W] 生成的眼部图像
         """
         block_idx = 0
-        mask_idx = 0
 
-        def _sub(idx):
-            """取第 idx 个 block 的 subject FiLM 参数"""
-            if subject_mods is not None:
-                s, sh = subject_mods[idx]
-                return s, sh
-            return None, None
+        def _lora(idx):
+            return subject_mods[idx] if subject_mods is not None else None
 
         # Patch embed
         x = self.x_embedder(eye_input)  # [B, C0, H, W]
@@ -414,30 +417,21 @@ class EyeOnlyGazeDiC(nn.Module):
 
         # Enc stage 0
         for block in self.enc_blocks[0]:
-            m = masks[mask_idx] if masks else None
-            ss, sh = _sub(block_idx)
-            x = block(x, emb_enc0, channel_mask=m, subject_scale=ss, subject_shift=sh)
-            mask_idx += 1
+            x = block(x, emb_enc0, subject_lora=_lora(block_idx))
             block_idx += 1
         skip_features.append(x)
         x = self.downs[0](x)
 
         # Enc stage 1
         for block in self.enc_blocks[1]:
-            m = masks[mask_idx] if masks else None
-            ss, sh = _sub(block_idx)
-            x = block(x, emb_enc1, channel_mask=m, subject_scale=ss, subject_shift=sh)
-            mask_idx += 1
+            x = block(x, emb_enc1, subject_lora=_lora(block_idx))
             block_idx += 1
         skip_features.append(x)
         x = self.downs[1](x)
 
         # Latent
         for block in self.lat_blocks[0]:
-            m = masks[mask_idx] if masks else None
-            ss, sh = _sub(block_idx)
-            x = block(x, emb_lat, channel_mask=m, subject_scale=ss, subject_shift=sh)
-            mask_idx += 1
+            x = block(x, emb_lat, subject_lora=_lora(block_idx))
             block_idx += 1
 
         # Decoder
@@ -445,14 +439,10 @@ class EyeOnlyGazeDiC(nn.Module):
 
         for i in range(2):
             x = self.ups[i](x)
-            # Skip connection (concat)
             skip = skip_features[1 - i]
             x = torch.cat([x, skip], dim=1)
             for block in self.dec_blocks[i]:
-                m = masks[mask_idx] if masks else None
-                ss, sh = _sub(block_idx)
-                x = block(x, emb_dec[i], channel_mask=m, subject_scale=ss, subject_shift=sh)
-                mask_idx += 1
+                x = block(x, emb_dec[i], subject_lora=_lora(block_idx))
                 block_idx += 1
 
         # Final layer
@@ -493,6 +483,7 @@ class EyeOnlyWrapper(nn.Module):
                 in_channels=subject_adapter_config.get('in_channels', 6),
                 subject_dim=subject_adapter_config.get('subject_dim', 128),
                 block_channels=self._get_block_channels(),
+                lora_rank=subject_adapter_config.get('lora_rank', 4),
             )
 
     def _get_block_channels(self):

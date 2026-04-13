@@ -110,10 +110,12 @@ def create_adapter(model, cfg, device):
     """Create a fresh SubjectAdapter (zero-init) attached to model."""
     block_channels = model._get_block_channels()
     in_ch = cfg.dic_unet_params.get('in_channels', 6)
+    adapter_cfg = cfg.get('subject_adapter_params', {})
     adapter = SubjectAdapter(
         in_channels=in_ch,
-        subject_dim=128,
+        subject_dim=adapter_cfg.get('subject_dim', 128),
         block_channels=block_channels,
+        lora_rank=adapter_cfg.get('lora_rank', 4),
     ).to(device)
     model.subject_adapter = adapter
     return adapter
@@ -170,93 +172,94 @@ def _make_eye_grid(source_eye, generated_tight, target_eye, max_samples=4):
     return grid  # [3, H', W']
 
 
-def pretrain_adapter_on_val(model, gaze_mlp, cfg, device, args):
-    """Pre-train a shared SubjectAdapter on all val subjects to get a good initialization.
+# def pretrain_adapter_on_val(model, gaze_mlp, cfg, device, args):
+#     """Pre-train a shared SubjectAdapter on all val subjects to get a good initialization.
 
-    Trains adapter (encoder + block_modulators) on the full val_dataloader for
-    args.pretrain_steps steps. The resulting weights serve as initialization for
-    per-user fine-tuning instead of zero-init.
+#     Trains adapter (encoder + block_modulators) on the full val_dataloader for
+#     args.pretrain_steps steps. The resulting weights serve as initialization for
+#     per-user fine-tuning instead of zero-init.
 
-    Returns:
-        pretrained_state: adapter state_dict (on CPU)
-    """
-    adapter = create_adapter(model, cfg, device)
-    adapter.train()
+#     Returns:
+#         pretrained_state: adapter state_dict (on CPU)
+#     """
+#     adapter = create_adapter(model, cfg, device)
+#     adapter.train()
 
-    val_ds = HDFDataset(
-        cfg.data.hdf_path,
-        split='val',
-        split_ratio=cfg.data.split_ratio,
-        seed=cfg.seed,
-        frame_offset_range=cfg.data.get('frame_offset_range', 2),
-        eye_crop_size=cfg.data.get('eye_crop_size', [64, 64]),
-        eye_expand_ratio=cfg.data.get('eye_expand_ratio', 1.5),
-        input_eye_crop_size=cfg.data.get('input_eye_crop_size', None),
-        input_eye_expand_ratio=cfg.data.get('input_eye_expand_ratio', None),
-    )
-    logger.info(f"Val dataset for adapter pre-training: {len(val_ds)} frames")
+#     val_ds = HDFDataset(
+#         cfg.data.hdf_path,
+#         split='val',
+#         split_ratio=cfg.data.split_ratio,
+#         seed=cfg.seed,
+#         frame_offset_range=cfg.data.get('frame_offset_range', 2),
+#         eye_crop_size=cfg.data.get('eye_crop_size', [64, 64]),
+#         eye_expand_ratio=cfg.data.get('eye_expand_ratio', 1.5),
+#         input_eye_crop_size=cfg.data.get('input_eye_crop_size', None),
+#         input_eye_expand_ratio=cfg.data.get('input_eye_expand_ratio', None),
+#     )
+#     logger.info(f"Val dataset for adapter pre-training: {len(val_ds)} frames")
 
-    dataloader = DataLoader(
-        val_ds, batch_size=args.batch_size,
-        shuffle=True, num_workers=args.num_workers,
-        pin_memory=True, drop_last=True,
-    )
+#     dataloader = DataLoader(
+#         val_ds, batch_size=args.batch_size,
+#         shuffle=True, num_workers=args.num_workers,
+#         pin_memory=True, drop_last=True,
+#     )
 
-    optimizer = torch.optim.AdamW(
-        [
-            {'params': adapter.encoder.parameters(),          'lr': args.pretrain_lr},
-            {'params': adapter.block_modulators.parameters(), 'lr': args.pretrain_lr * 5},
-        ],
-        betas=(0.9, 0.999), weight_decay=args.weight_decay,
-    )
-    lr_sched = get_scheduler(
-        "cosine", optimizer=optimizer,
-        num_warmup_steps=min(100, args.pretrain_steps // 10),
-        num_training_steps=args.pretrain_steps,
-    )
+#     optimizer = torch.optim.AdamW(
+#         [
+#             {'params': adapter.encoder.parameters(),           'lr': args.pretrain_lr},
+#             {'params': adapter.shared_trunk.parameters(),      'lr': args.pretrain_lr * 2},
+#             {'params': adapter.block_lora_heads.parameters(),  'lr': args.pretrain_lr * 5},
+#         ],
+#         betas=(0.9, 0.999), weight_decay=args.weight_decay,
+#     )
+#     lr_sched = get_scheduler(
+#         "cosine", optimizer=optimizer,
+#         num_warmup_steps=min(100, args.pretrain_steps // 10),
+#         num_training_steps=args.pretrain_steps,
+#     )
 
-    data_iter = iter(dataloader)
-    for step in range(1, args.pretrain_steps + 1):
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
+#     data_iter = iter(dataloader)
+#     for step in range(1, args.pretrain_steps + 1):
+#         try:
+#             batch = next(data_iter)
+#         except StopIteration:
+#             data_iter = iter(dataloader)
+#             batch = next(data_iter)
 
-        source_eye  = batch['source_input_eye_crops'].to(device)
-        target_eye  = batch['target_eye_crops'].to(device)
-        target_gaze = batch['target_gaze'].to(device)
-        target_head = batch['target_head'].to(device)
+#         source_eye  = batch['source_input_eye_crops'].to(device)
+#         target_eye  = batch['target_eye_crops'].to(device)
+#         target_gaze = batch['target_gaze'].to(device)
+#         target_head = batch['target_head'].to(device)
 
-        with torch.no_grad():
-            head_emb, gaze_emb = gaze_mlp(target_head, target_gaze)
-            gaze_prompt = torch.cat([head_emb.unsqueeze(1), gaze_emb.unsqueeze(1)], dim=1)
+#         with torch.no_grad():
+#             head_emb, gaze_emb = gaze_mlp(target_head, target_gaze)
+#             gaze_prompt = torch.cat([head_emb.unsqueeze(1), gaze_emb.unsqueeze(1)], dim=1)
 
-        generated = model(source_eye, gaze_prompt)
+#         generated = model(source_eye, gaze_prompt)
 
-        in_h, in_w   = source_eye.shape[-2:]
-        tgt_h, tgt_w = target_eye.shape[-2:]
-        if in_h != tgt_h or in_w != tgt_w:
-            ph = (in_h - tgt_h) // 2
-            pw = (in_w - tgt_w) // 2
-            generated_tight = generated[:, :, ph:ph+tgt_h, pw:pw+tgt_w]
-        else:
-            generated_tight = generated
+#         in_h, in_w   = source_eye.shape[-2:]
+#         tgt_h, tgt_w = target_eye.shape[-2:]
+#         if in_h != tgt_h or in_w != tgt_w:
+#             ph = (in_h - tgt_h) // 2
+#             pw = (in_w - tgt_w) // 2
+#             generated_tight = generated[:, :, ph:ph+tgt_h, pw:pw+tgt_w]
+#         else:
+#             generated_tight = generated
 
-        loss = F.l1_loss(generated_tight, target_eye)
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(adapter.parameters(), 1.0)
-        optimizer.step()
-        lr_sched.step()
+#         loss = F.l1_loss(generated_tight, target_eye)
+#         optimizer.zero_grad()
+#         loss.backward()
+#         torch.nn.utils.clip_grad_norm_(adapter.parameters(), 1.0)
+#         optimizer.step()
+#         lr_sched.step()
 
-        if step % args.log_every == 0:
-            logger.info(f"  [pretrain] step {step}/{args.pretrain_steps}  l1={loss.item():.4f}  lr={lr_sched.get_last_lr()[0]:.2e}")
+#         if step % args.log_every == 0:
+#             logger.info(f"  [pretrain] step {step}/{args.pretrain_steps}  l1={loss.item():.4f}  lr={lr_sched.get_last_lr()[0]:.2e}")
 
-    pretrained_state = {k: v.cpu().clone() for k, v in adapter.state_dict().items()}
-    model.subject_adapter = None
-    logger.info(f"Adapter pre-training done ({args.pretrain_steps} steps on val set)")
-    return pretrained_state
+#     pretrained_state = {k: v.cpu().clone() for k, v in adapter.state_dict().items()}
+#     model.subject_adapter = None
+#     logger.info(f"Adapter pre-training done ({args.pretrain_steps} steps on val set)")
+#     return pretrained_state
 
 
 def finetune_one_subject(
@@ -310,11 +313,12 @@ def finetune_one_subject(
         pin_memory=True, drop_last=len(train_ds) > args.batch_size,
     )
 
-    # Optimizer: two param groups — block_modulators (zero-init) get higher LR
+    # Optimizer: three param groups — lora_heads (zero-init) get highest LR
     optimizer = torch.optim.AdamW(
         [
-            {'params': adapter.encoder.parameters(),          'lr': args.lr},
-            {'params': adapter.block_modulators.parameters(), 'lr': args.lr * 5},
+            {'params': adapter.encoder.parameters(),           'lr': args.lr},
+            {'params': adapter.shared_trunk.parameters(),      'lr': args.lr * 2},
+            {'params': adapter.block_lora_heads.parameters(),  'lr': args.lr * 5},
         ],
         betas=(0.9, 0.999),
         weight_decay=args.weight_decay,
@@ -464,6 +468,8 @@ def main():
                         help="LR for val-set pre-training phase")
     parser.add_argument("--vis_every", type=int, default=100,
                         help="TensorBoard image visualization interval (steps)")
+    parser.add_argument("--log_every", type=int, default=50,
+                        help="Logging interval (steps)")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str,
@@ -510,9 +516,9 @@ def main():
 
     # Optional: pre-train adapter on full val set for a better initialization
     init_state = None
-    if args.pretrain_steps > 0:
-        logger.info(f"Pre-training adapter on val set for {args.pretrain_steps} steps...")
-        init_state = pretrain_adapter_on_val(model, gaze_mlp, cfg, device, args)
+    # if args.pretrain_steps > 0:
+    #     logger.info(f"Pre-training adapter on val set for {args.pretrain_steps} steps...")
+    #     init_state = pretrain_adapter_on_val(model, gaze_mlp, cfg, device, args)
 
     logger.info(f"Fine-tuning {len(subject_keys)} subjects, {args.max_steps} steps each")
 
@@ -541,7 +547,8 @@ def main():
             'subject_adapter_state_dict': state,
             'config': {
                 'in_channels': cfg.dic_unet_params.get('in_channels', 6),
-                'subject_dim': 128,
+                'subject_dim': cfg.get('subject_adapter_params', {}).get('subject_dim', 128),
+                'lora_rank': cfg.get('subject_adapter_params', {}).get('lora_rank', 4),
                 'max_steps': args.max_steps,
                 'lr': args.lr,
             },
