@@ -464,6 +464,8 @@ def main():
                         help="LR for val-set pre-training phase")
     parser.add_argument("--vis_every", type=int, default=100,
                         help="TensorBoard image visualization interval (steps)")
+    parser.add_argument("--log_every", type=int, default=50,
+                        help="Logging interval (steps)")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str,
