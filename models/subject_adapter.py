@@ -30,12 +30,12 @@ class SubjectEncoder(nn.Module):
     """Lightweight appearance encoder: source_eye → subject embedding.
 
     4-stage conv (stride-2 × 3) + GAP + Linear + LayerNorm.
-    Input:  [B, C_in, H, W]   (default C_in=6, H≈64-80, W≈128-160)
+    Input:  [B, C_in, H, W]   (default C_in=3, H≈80, W≈160 for width-concat)
     Output: [B, subject_dim]
 
-    ~120K params (C_in=6, subject_dim=128)
+    ~120K params (C_in=3, subject_dim=128)
     """
-    def __init__(self, in_channels: int = 6, subject_dim: int = 128):
+    def __init__(self, in_channels: int = 3, subject_dim: int = 128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, 16, 3, padding=1),    # [B, 16, H, W]
@@ -75,13 +75,13 @@ class SubjectAdapter(nn.Module):
     """
     def __init__(
         self,
-        in_channels: int = 6,
+        in_channels: int = 3,
         subject_dim: int = 128,
         block_channels=None,
     ):
         """
         Args:
-            in_channels:    eye crop input channels (6 = left+right concat)
+            in_channels:    eye crop input channels (3 = width-concat RGB)
             subject_dim:    subject embedding dimension (default 128)
             block_channels: list[int], out_channels per UNetBlock in traversal order
                             (enc0 → enc1 → latent → dec0 → dec1).

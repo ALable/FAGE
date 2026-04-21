@@ -1,6 +1,11 @@
 __pycache__/
 
 /inference_results/*
+/inference_mpiigaze/
+
+# Debug scripts and generated docs
+debug/
+docs/
 
 # Experiment artifacts
 adapter/

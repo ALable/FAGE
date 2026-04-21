@@ -1,11 +1,19 @@
-# FAGE Phase 1: Eye-Only Generation (共享预训练)
+# FAGE Phase 1: Eye-Only Generation (v2 — improved over v1)
+# 主要改动（相较 v1）：
+#   1. start_gan: 3000 → 20000       修复 LR-GAN 时机错位，GAN 在 LR 峰值平台期进场
+#   2. gaze_perceptual_loss: 0.01 → 0.05  5× 增强注视方向约束
+#   3. start_gaze_perceptual: 500 → 200   更早引入 gaze loss
+#   4. gazenet num_layers: 4 → 6, num_hidden: 128 → 256  增强 gaze embedding 表达力
+#   5. max_train_steps: 200000 → 300000   给 GAN 充足训练窗口（GAN 进场后仍有 280k 步）
+#   6. lr_warmup_steps: 500 → 1000        更稳定的 warmup
+# 注：vgg_layer_weight / eye_l1_loss 在 train.py 中未被读取，不做修改
 model_name: "FAGE"
-exp_name: "FAGE-EyeOnly-v1"
-output_dir: "/mnt/data/xhy/Logs/FAGE/logs/EyeOnly/4-15"
+exp_name: "FAGE-EyeOnly-v2"
+output_dir: "/mnt/data/xhy/Logs/FAGE/logs/EyeOnly/4-17"
 resume_from_checkpoint: False
 seed: 42
 
-# Data
+# Data（与 v1 相同）
 data:
   dataset_type: "gaze_hdf"
   hdf_path: "/mnt/data/xhy/eye-concat/GazeCapture_256.h5"
@@ -14,31 +22,31 @@ data:
   image_size: 256
   split_ratio: [0.8, 0.1, 0.1]
   frame_offset_range: 8
-  max_head_diff: 0.1        # 头姿差异上限 (rad, ~5.7°)；None 关闭过滤
-  max_target_retries: 20    # 候选帧数上限（frame_offset_range 扩大后可适当减小）
+  max_head_diff: 0.1
+  max_target_retries: 20
   eye_crop_size: [64, 64]
   eye_expand_ratio: 1.5
   input_eye_crop_size: [80, 80]
   input_eye_expand_ratio: 2.0
 
-# Pretrained gaze estimator (for gaze perceptual loss)
+# Pretrained gaze estimator（与 v1 相同）
 pretrained:
   gaze_eval_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadResNet/checkpoints/latest.pth"
   gaze_train_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadNet/checkpoints/best.pth"
 
-# Loss weights
+# Loss weights — 改动 2 项（vgg_layer_weight/eye_l1_loss 在 train.py 中未被读取，保持 v1 原值）
 loss_params:
   l1_loss: 2.0
   eye_l1_loss: 4.0
   vgg_layer_weight: [5, 5, 5, 0, 0]
   pyramid_scale: [1, 0.5, 0.25]
   eye_gan_loss: 0.3
-  gaze_perceptual_loss: 0.01
-  start_gaze_perceptual: 500
+  gaze_perceptual_loss: 0.05        # v1: 0.01 → 5× 增强注视方向约束
+  start_gaze_perceptual: 200        # v1: 500 → 更早引入 gaze 约束
   id_loss: 0.1
   start_id_loss: 1000
 
-# Eye-Only UNet
+# Eye-Only UNet（与 v1 相同，容量不变，先验证 loss 改动的效果）
 dic_unet_params:
   in_channels: 3
   hidden_size: 32
@@ -54,7 +62,7 @@ dic_unet_params:
   dropout: 0.1
   blockconfig: 2
 
-# Discriminator (for eye crops)
+# Discriminator — start_gan 延迟至 20000，让 LR 在峰值平台充分热身
 discriminator_train_params:
   discriminator_type: 'multi-scale'
   ndf: 64
@@ -63,13 +71,13 @@ discriminator_train_params:
   weight_decay: 0.01
   betas: [0.5, 0.999]
   epochs: 10000
-  start_gan: 3000
+  start_gan: 20000                  # v1: 3000 → 修复 LR-GAN 时机错位
 
 model_params:
   gazenet_params:
-    num_layers: 4
+    num_layers: 6                   # v1: 4 → 增强 gaze embedding 表达能力
     num_in: 2
-    num_hidden: 128
+    num_hidden: 256                 # v1: 128 → 更宽的 MLP
   discriminator_params:
     scales: [1]
     block_expansion: 32
@@ -78,15 +86,15 @@ model_params:
     sn: True
     image_channel: 3
 
-# Solver
+# Solver — 延长总步数 + 加长 warmup
 solver:
   gradient_accumulation_steps: 1
   mixed_precision: 'no'
-  max_train_steps: 200000
+  max_train_steps: 300000           # v1: 200000 → 给 GAN 充足的训练窗口
   max_grad_norm: 1.0
   learning_rate: 1.0e-4
   scale_lr: False
-  lr_warmup_steps: 500
+  lr_warmup_steps: 1000             # v1: 500 → 更稳定的 warmup
   lr_scheduler: "cosine"
   adam_beta1: 0.5
   adam_beta2: 0.999
@@ -95,7 +103,7 @@ solver:
 
 # Checkpointing
 total_limit: 3
-save_model_epoch_interval: 200000
+save_model_epoch_interval: 300000
 checkpointing_steps: 5000
 val_freq: 2000
 val_batch_limit: 8

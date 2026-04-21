@@ -1,21 +1,19 @@
-# FAGE Phase 1: Eye-Only Generation (共享预训练)
+# FAGE Phase 1: Eye-Only Generation on MPIIGaze (共享预训练)
 model_name: "FAGE"
-exp_name: "FAGE-EyeOnly-v1"
-output_dir: "/mnt/data/xhy/Logs/FAGE/logs/EyeOnly/4-15"
+exp_name: "FAGE-EyeOnly-MPIIGaze-v1"
+output_dir: "/mnt/data/xhy/Logs/FAGE/logs/EyeOnly/MPIIGaze"
 resume_from_checkpoint: False
 seed: 42
 
 # Data
 data:
   dataset_type: "gaze_hdf"
-  hdf_path: "/mnt/data/xhy/eye-concat/GazeCapture_256.h5"
+  hdf_path: "/mnt/data/xhy/eye-concat/MPIIGaze_256.h5"
   train_bs: 16
   num_workers: 6
   image_size: 256
-  split_ratio: [0.8, 0.1, 0.1]
-  frame_offset_range: 8
-  max_head_diff: 0.1        # 头姿差异上限 (rad, ~5.7°)；None 关闭过滤
-  max_target_retries: 20    # 候选帧数上限（frame_offset_range 扩大后可适当减小）
+  split_ratio: [0.8, 0.1, 0.1]  # 12 train / 2 val / 1 test (15 subjects total)
+  frame_offset_range: 4
   eye_crop_size: [64, 64]
   eye_expand_ratio: 1.5
   input_eye_crop_size: [80, 80]
@@ -24,7 +22,7 @@ data:
 # Pretrained gaze estimator (for gaze perceptual loss)
 pretrained:
   gaze_eval_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadResNet/checkpoints/latest.pth"
-  gaze_train_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadNet/checkpoints/best.pth"
+  gaze_train_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/Unet-Gaze/GazeHeadNet/checkpoints/best.pth"
 
 # Loss weights
 loss_params:

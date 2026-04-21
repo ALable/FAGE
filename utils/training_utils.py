@@ -27,7 +27,7 @@ from loss.vgg_eye import GazePerceptualLoss
 from loss.basic_loss import Interpolate
 from loss.basic_loss import gaze_angular_loss as gaze_angular_error
 from loss.basic_loss import IDLoss
-from loss.discriminator import MultiScaleDiscriminator, PatchGAN
+from loss.discriminator import MultiScaleDiscriminator
 
 
 def seed_everything(seed):
@@ -295,12 +295,12 @@ def initialize_loss_functions(cfg, accelerator, scheduler_max_steps):
             # loss_dict['eye_discriminator_full'] = PatchGANWithMaskLoss(eye_disc)
 
         elif discriminator_type == 'multi-scale':
-            # Multi-Scale eye discriminator (6 channels: left eye 3ch + right eye 3ch)
-            print("📦 Initializing Multi-Scale eye discriminator (6-channel input)...")
+            # Multi-Scale eye discriminator (3 channels: left+right eye width-concatenated)
+            print("📦 Initializing Multi-Scale eye discriminator (3-channel input)...")
             eye_disc_params = dict(cfg.model_params.discriminator_params)
             # 修改参数名：image_channel -> num_channels (Discriminator 构造函数的参数名)
             eye_disc_params.pop('image_channel', None)  # 移除旧参数
-            eye_disc_params['num_channels'] = 6  # 左眼3通道 + 右眼3通道
+            eye_disc_params['num_channels'] = 3  # 左右眼宽度拼接，3通道
             loss_dict['eye_discriminator'] = MultiScaleDiscriminator(
                 **eye_disc_params).to(accelerator.device)
         else:

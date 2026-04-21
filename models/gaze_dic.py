@@ -149,8 +149,6 @@ class UNetBlock(nn.Module):
         self.skip_scale = skip_scale
         self.dropout = dropout
 
-        self.noise_scale = nn.Parameter(torch.zeros(1, out_channels, 1, 1))
-
         # Norm + Conv 0
         self.norm0 = GroupNorm(in_channels, num_groups, min_channels, eps)
         self.conv0 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
@@ -188,11 +186,6 @@ class UNetBlock(nn.Module):
         # 1. Norm + Conv0
         x = self.norm0(x)
         x = self.conv0(self.act0(x))
-
-        # 2. Training noise
-        # if self.training:
-        #     noise = torch.randn(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device)
-        #     x = x + noise * self.noise_scale
 
         # 3. Affine params from gaze condition
         params = self.affine(emb)
@@ -252,8 +245,8 @@ class Upsample(nn.Module):
 
 class EyeOnlyGazeDiC(nn.Module):
     """
-    输入: [B, 3, 64, 128] (左眼64x64 | 右眼64x64 横向拼接)
-    输出: [B, 3, 64, 128]
+    输入: [B, 3, H, W*2] (左眼 | 右眼 横向拼接, e.g. 80x160 input / 64x128 tight)
+    输出: [B, 3, H, W*2]
 
     3-level UNet: enc0 → enc1 → latent → dec1 → dec0
     分辨率: 64x128 → 32x64 → 16x32 → 32x64 → 64x128
@@ -490,7 +483,7 @@ class EyeOnlyWrapper(nn.Module):
         if subject_adapter_config is not None:
             from models.subject_adapter import SubjectAdapter
             self.subject_adapter = SubjectAdapter(
-                in_channels=subject_adapter_config.get('in_channels', 6),
+                in_channels=subject_adapter_config.get('in_channels', 3),
                 subject_dim=subject_adapter_config.get('subject_dim', 128),
                 block_channels=self._get_block_channels(),
             )
@@ -528,7 +521,7 @@ class EyeOnlyWrapper(nn.Module):
         """推理时将生成的眼睛贴回原图
 
         Args:
-            generated_eyes: [B, 6, 64, 64] (左眼前3通道 | 右眼后3通道)
+            generated_eyes: [B, 3, H, W*2] (左眼 | 右眼 width concat)
             source_image: [B, 3, 256, 256] 原始 source 脸
             eye_bbox: [B, 8] 归一化坐标 [lx1,ly1,lx2,ly2, rx1,ry1,rx2,ry2]
             blend_margin: 边缘渐变像素数
@@ -537,8 +530,9 @@ class EyeOnlyWrapper(nn.Module):
         """
         B, _, H, W = source_image.shape
         result = source_image.clone()
-        left_eye  = generated_eyes[:, :3, :, :]
-        right_eye = generated_eyes[:, 3:, :, :]
+        w_single = generated_eyes.shape[-1] // 2
+        left_eye  = generated_eyes[:, :, :, :w_single]
+        right_eye = generated_eyes[:, :, :, w_single:]
 
         for b in range(B):
             for eye_crop, bbox_slice in [(left_eye, slice(0, 4)), (right_eye, slice(4, 8))]:

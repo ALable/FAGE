@@ -37,7 +37,10 @@ class HDFDataset(Dataset):
                  input_eye_crop_size=None,
                  input_eye_expand_ratio=None,
                  transform=None,
-                 pick_at_least_per_person=2):
+                 pick_at_least_per_person=2,
+                 max_head_diff=None,
+                 min_gaze_diff=None,
+                 max_target_retries=10):
         """
         Args:
             hdf_file_path: HDF5 文件路径
@@ -45,17 +48,23 @@ class HDFDataset(Dataset):
             split_ratio: 训练/验证/测试比例
             seed: 随机种子
             split_json_path: 预定义 split JSON 路径 (None=随机 split)
-            frame_offset_range: 相邻帧偏移范围 ±N
+            frame_offset_range: 相邻帧偏移范围 ±N（无过滤时生效）
             eye_crop_size: 每只眼 crop 尺寸 (H, W)
             eye_expand_ratio: 眼部 bbox 扩展倍率
             transform: 自定义 transform (默认 ToTensor + Normalize)
             pick_at_least_per_person: 每个用户最少帧数 (配对需要至少2帧)
+            max_head_diff: 头姿差异上限 (rad)，超过则重新选取 target；None=不过滤
+            min_gaze_diff: 注视差异下限 (rad)，在满足头姿条件的候选中优先选差异大的；None=随机选
+            max_target_retries: 过滤时最多尝试的候选帧数（从全片段随机采样）
         """
         assert os.path.isfile(hdf_file_path), f"HDF5 not found: {hdf_file_path}"
         self.hdf_path = hdf_file_path
         self.hdf = None
         self.split = split
         self.frame_offset_range = frame_offset_range
+        self.max_head_diff       = max_head_diff
+        self.min_gaze_diff       = min_gaze_diff
+        self.max_target_retries  = max_target_retries
         self.eye_crop_size = eye_crop_size
         self.eye_expand_ratio = eye_expand_ratio
         # 模型输入尺寸（比监督尺寸更大，默认与监督相同退化）
@@ -136,8 +145,8 @@ class HDFDataset(Dataset):
             face_parsing: [H, W] uint8 (1=left_eye, 2=right_eye)
 
         Returns:
-            input_tensor:  [6, in_h, in_w]   大范围，模型输入
-            target_tensor: [6, crop_h, crop_w] 紧范围，loss 监督
+            input_tensor:  [3, in_h, in_w*2]   大范围，模型输入（width concat）
+            target_tensor: [3, crop_h, crop_w*2] 紧范围，loss 监督（width concat）
             eye_bbox:      [8] float tensor 归一化坐标（基于 tight bbox，用于 paste_eyes）
         """
         H, W = image_np.shape[:2]
@@ -182,11 +191,11 @@ class HDFDataset(Dataset):
             input_crops.append( np.zeros((in_h,   in_w,   3), dtype=np.uint8))
             bbox_list.extend([0, 0, 0, 0])
 
-        # 通道堆叠左右眼
+        # 宽度拼接左右眼 (width concat)
         input_tensor  = torch.cat([self.to_tensor(Image.fromarray(input_crops[0])),
-                                   self.to_tensor(Image.fromarray(input_crops[1]))],  dim=0)  # [6, in_h, in_w]
+                                   self.to_tensor(Image.fromarray(input_crops[1]))],  dim=2)  # [3, in_h, in_w*2]
         target_tensor = torch.cat([self.to_tensor(Image.fromarray(target_crops[0])),
-                                   self.to_tensor(Image.fromarray(target_crops[1]))], dim=0)  # [6, crop_h, crop_w]
+                                   self.to_tensor(Image.fromarray(target_crops[1]))], dim=2)  # [3, crop_h, crop_w*2]
         bbox_tensor   = torch.tensor(bbox_list, dtype=torch.float32)
         return input_tensor, target_tensor, bbox_tensor
 
@@ -218,6 +227,51 @@ class HDFDataset(Dataset):
 
         return image, face_parsing, gaze, head
 
+    def _pick_target_index(self, key, source_index, source_gaze, source_head, num_frames):
+        """从 ±frame_offset_range 内的候选帧中，选出头姿接近且注视差异最大的 target
+
+        策略:
+          1. 枚举 ±frame_offset_range 内所有合法候选（不含自身，去重）
+          2. 一次 fancy-index 读取所有候选的 labels（只读标签，不读像素）
+          3. 若开启过滤：筛选 head_diff ≤ max_head_diff 的合格帧；无合格帧时回退到 head_diff 最小者
+          4. 在合格帧中选 gaze_diff 最大的
+        """
+        # 枚举候选 indices，去重、去掉退化到 source 自身的
+        seen = set()
+        candidates = []
+        for o in range(-self.frame_offset_range, self.frame_offset_range + 1):
+            if o == 0:
+                continue
+            tidx = max(0, min(num_frames - 1, source_index + o))
+            if tidx != source_index and tidx not in seen:
+                seen.add(tidx)
+                candidates.append(tidx)
+
+        if not candidates:
+            return (source_index + 1) % num_frames
+
+        if self.max_head_diff is None:
+            # 无过滤：随机选一个（兼容原行为）
+            return random.choice(candidates)
+
+        # 一次 fancy-index 读全部候选的 labels，避免逐帧 IO
+        cand_arr = np.array(candidates)
+        cand_labels = self.hdf[key]['labels'][cand_arr]          # [K, 4]
+        cand_gaze   = cand_labels[:, 0:2].astype(np.float32)    # [K, 2]
+        cand_head   = cand_labels[:, 2:4].astype(np.float32)    # [K, 2]
+
+        head_diffs = np.linalg.norm(cand_head - source_head, axis=1)  # [K]
+        gaze_diffs = np.linalg.norm(cand_gaze - source_gaze, axis=1)  # [K]
+
+        valid_mask = head_diffs <= self.max_head_diff
+        if not valid_mask.any():
+            # 无合格候选：回退到 head_diff 最小的
+            return candidates[int(np.argmin(head_diffs))]
+
+        # 合格帧中选 gaze_diff 最大的
+        masked_gaze = np.where(valid_mask, gaze_diffs, -1.0)
+        return candidates[int(np.argmax(masked_gaze))]
+
     def __getitem__(self, idx):
         """返回配对帧 (source + target)
 
@@ -225,13 +279,13 @@ class HDFDataset(Dataset):
             dict with:
                 source_image:             [3, H, W]        全脸图像
                 source_gaze, source_head: [2]              注视/头姿角度 (rad)
-                source_input_eye_crops:   [6, in_h, in_w]  大范围眼部 crop，模型输入
-                source_eye_crops:         [6, h, w]        紧范围眼部 crop，GT 备用
+                source_input_eye_crops:   [3, in_h, in_w*2]  大范围眼部 crop，模型输入（width concat）
+                source_eye_crops:         [3, h, w*2]        紧范围眼部 crop，GT 备用（width concat）
                 source_eye_bbox:          [8]              归一化 bbox 坐标 (tight)
                 target_image:             [3, H, W]        全脸图像
                 target_gaze, target_head: [2]              注视/头姿角度 (rad)
-                target_input_eye_crops:   [6, in_h, in_w]  大范围眼部 crop（暂未用）
-                target_eye_crops:         [6, h, w]        紧范围眼部 crop，loss 监督
+                target_input_eye_crops:   [3, in_h, in_w*2]  大范围眼部 crop（暂未用）
+                target_eye_crops:         [3, h, w*2]        紧范围眼部 crop，loss 监督（width concat）
                 target_eye_bbox:          [8]              归一化 bbox 坐标 (tight)
                 subject_idx:              int              用户编号
         """
@@ -242,17 +296,10 @@ class HDFDataset(Dataset):
         key, index = self.index_to_query[idx]
         source_np, source_parsing, source_gaze, source_head = self._load_frame(key, index)
 
-        # === Target 帧 (同一用户的相邻帧) ===
+        # === Target 帧：头姿接近、注视差异大 ===
         group = self.hdf[key]
         num_frames = group['pixels'].shape[0]
-
-        # 在 ±offset_range 内随机选取 (避免选到自身)
-        offsets = list(range(-self.frame_offset_range, self.frame_offset_range + 1))
-        offsets = [o for o in offsets if o != 0]
-        offset = random.choice(offsets)
-        target_index = max(0, min(num_frames - 1, index + offset))
-        if target_index == index:
-            target_index = (index + 1) % num_frames
+        target_index = self._pick_target_index(key, index, source_gaze, source_head, num_frames)
 
         target_np, target_parsing, target_gaze, target_head = self._load_frame(key, target_index)
 
@@ -271,15 +318,15 @@ class HDFDataset(Dataset):
             'source_image': source_image,
             'source_gaze': torch.from_numpy(source_gaze),
             'source_head': torch.from_numpy(source_head),
-            'source_input_eye_crops': src_input,   # [6, in_h, in_w]  大范围，模型输入
-            'source_eye_crops':       src_target,  # [6, h, w]        紧范围，GT（备用）
+            'source_input_eye_crops': src_input,   # [3, in_h, in_w*2]  大范围，模型输入（width concat）
+            'source_eye_crops':       src_target,  # [3, h, w*2]        紧范围，GT（备用）
             'source_eye_bbox': source_eye_bbox,
 
             'target_image': target_image,
             'target_gaze': torch.from_numpy(target_gaze),
             'target_head': torch.from_numpy(target_head),
-            'target_input_eye_crops': tgt_input,   # [6, in_h, in_w]  大范围（暂未用）
-            'target_eye_crops':       tgt_target,  # [6, h, w]        紧范围，loss 监督
+            'target_input_eye_crops': tgt_input,   # [3, in_h, in_w*2]  大范围（暂未用）
+            'target_eye_crops':       tgt_target,  # [3, h, w*2]        紧范围，loss 监督（width concat）
             'target_eye_bbox': target_eye_bbox,
 
             'subject_idx': subject_idx,

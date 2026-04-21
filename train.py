@@ -3,9 +3,15 @@ FAGE — Training Script for Eye-Only Gaze Generation (Phase 1: Shared Pretraini
 
 Train GazeControlNet (EyeOnlyGazeDiC + GazeMLP) on all users.
 Per-user SubjectAdapter fine-tuning → see finetune_adapter.py
+
+
+accelerate launch --num_processes 4 train.py --config configs/training/dic_eye_only.yaml
+
+
 """
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+import random
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from tqdm.auto import tqdm
 from omegaconf import OmegaConf
 from datetime import timedelta, datetime
@@ -23,6 +29,7 @@ import shutil
 from models.gaze_dic import EyeOnlyWrapper
 from models.gazenet import MLPNetwork
 from dataset.gaze_capture import HDFDataset
+from dataset.eth_xgaze_paired import ETHXGazePairedDataset
 from torch.utils.data import DataLoader
 from utils.training_utils import initialize_loss_functions
 from loss.basic_loss import discriminator_loss, generator_loss, gaze_angular_loss
@@ -64,6 +71,31 @@ def create_gaze_mlp(cfg):
     return gaze_mlp
 
 
+def build_g_lr_scheduler(optimizer, cfg):
+    """Two-phase G scheduler that keeps LR at peak until D joins.
+
+    Phase 0  [0, warmup)           – linear warm-up
+    Phase 1  [warmup, start_gan)   – flat at peak LR  ← D not yet active
+    Phase 2  [start_gan, max]      – cosine decay to 0 ← D and G train together
+
+    This prevents the common failure mode where a global cosine schedule
+    decays G's LR to near-zero by the time D enters training.
+    """
+    warmup    = cfg.solver.lr_warmup_steps
+    start_gan = cfg.discriminator_train_params.start_gan
+    max_steps = cfg.solver.max_train_steps
+
+    def lr_lambda(current_step: int) -> float:
+        if current_step < warmup:
+            return float(current_step) / float(max(1, warmup))
+        if current_step < start_gan:
+            return 1.0  # flat: G is at peak when D enters
+        progress = float(current_step - start_gan) / float(max(1, max_steps - start_gan))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def _get_tb_writer(accelerator):
     """从 accelerator trackers 中取出 TensorBoard SummaryWriter"""
     for tracker in accelerator.trackers:
@@ -78,16 +110,12 @@ def _denorm(t):
 
 
 def _eye_to_grid(eye_tensor, n=4):
-    """将 [B,6,H,W] 的眼部 tensor 拆成左右眼，横向拼接后做 make_grid
+    """将 [B,3,H,W*2] 的眼部 tensor（width concat）直接做 make_grid
 
     返回: [3, H, n*(W*2+2)] 的可视化 grid
     """
-    imgs = _denorm(eye_tensor[:n].detach().float().cpu())
-    left  = imgs[:, :3]           # [n, 3, H, W]
-    right = imgs[:, 3:]           # [n, 3, H, W]
-    # 左右横向拼 → [n, 3, H, W*2]
-    lr = torch.cat([left, right], dim=3)
-    return make_grid(lr, nrow=n, padding=2)
+    imgs = _denorm(eye_tensor[:n].detach().float().cpu())  # [n, 3, H, W*2]
+    return make_grid(imgs, nrow=n, padding=2)
 
 
 def log_vis(accelerator, global_step, source_eye_large, generated_tight,
@@ -189,13 +217,8 @@ def main(cfg, config_file_path=None):
     )
 
     # === LR scheduler ===
-    from diffusers.optimization import get_scheduler
-    lr_scheduler = get_scheduler(
-        cfg.solver.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=cfg.solver.lr_warmup_steps,
-        num_training_steps=cfg.solver.max_train_steps,
-    )
+    # 两阶段：warmup → flat（G-only 阶段 LR 保持峰值）→ cosine 衰减（D 加入后才开始衰减）
+    lr_scheduler = build_g_lr_scheduler(optimizer, cfg)
 
     # === Dataset ===
     _ds_kwargs = dict(
@@ -206,10 +229,35 @@ def main(cfg, config_file_path=None):
         eye_expand_ratio=cfg.data.get('eye_expand_ratio', 1.5),
         input_eye_crop_size=cfg.data.get('input_eye_crop_size', None),
         input_eye_expand_ratio=cfg.data.get('input_eye_expand_ratio', None),
+        max_head_diff=cfg.data.get('max_head_diff', None),
+        max_target_retries=cfg.data.get('max_target_retries', 10),
     )
 
-    train_dataset = HDFDataset(cfg.data.hdf_path, split='train', **_ds_kwargs)
-    val_dataset   = HDFDataset(cfg.data.hdf_path, split='val',   **_ds_kwargs)
+    # Select dataset based on config
+    dataset_type = cfg.data.get('dataset_type', 'gaze_hdf')
+
+    if dataset_type == 'eth_xgaze':
+        logger.info("Using ETH-XGaze LMDB dataset")
+        train_dataset = ETHXGazePairedDataset(
+            cfg.data.lmdb_path,
+            split='train',
+            resolution=cfg.data.get('image_size', 256),
+            aug=False,
+            **_ds_kwargs
+        )
+        val_dataset = ETHXGazePairedDataset(
+            cfg.data.lmdb_path,
+            split='val',
+            resolution=cfg.data.get('image_size', 256),
+            aug=False,
+            **_ds_kwargs
+        )
+    elif dataset_type == 'gaze_hdf':
+        logger.info("Using GazeCapture HDF5 dataset")
+        train_dataset = HDFDataset(cfg.data.hdf_path, split='train', **_ds_kwargs)
+        val_dataset   = HDFDataset(cfg.data.hdf_path, split='val',   **_ds_kwargs)
+    else:
+        raise ValueError(f"Unknown dataset_type: {dataset_type}. Must be 'gaze_hdf' or 'eth_xgaze'")
 
     train_dataloader = DataLoader(
         train_dataset, batch_size=cfg.data.train_bs,
@@ -270,22 +318,51 @@ def main(cfg, config_file_path=None):
     logger.info(f"Batch size: {cfg.data.train_bs}, Train samples: {len(train_dataset)}")
 
     global_step = 0
+    start_epoch = 0
+    steps_to_skip = 0
+
+    # === 断点续训 ===
+    resume_path = cfg.get('resume_from_checkpoint', False)
+    if resume_path and isinstance(resume_path, str) and os.path.exists(resume_path):
+        logger.info(f"从 checkpoint 恢复: {resume_path}")
+        ckpt = torch.load(resume_path, map_location='cpu')
+        global_step = ckpt.get('global_step', 0)
+        accelerator.unwrap_model(model).load_state_dict(ckpt['model_state_dict'])
+        accelerator.unwrap_model(gaze_mlp).load_state_dict(ckpt['gaze_mlp_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if 'lr_scheduler_state_dict' in ckpt:
+            lr_scheduler.load_state_dict(ckpt['lr_scheduler_state_dict'])
+        if 'discriminator_state_dict' in ckpt and 'eye_discriminator' in loss_dict:
+            accelerator.unwrap_model(loss_dict['eye_discriminator']).load_state_dict(
+                ckpt['discriminator_state_dict'])
+        if 'optimizer_D_state_dict' in ckpt and 'eye_optimizer_D' in loss_dict:
+            loss_dict['eye_optimizer_D'].load_state_dict(ckpt['optimizer_D_state_dict'])
+        if 'scheduler_D_state_dict' in ckpt and 'eye_scheduler_D' in loss_dict:
+            loss_dict['eye_scheduler_D'].load_state_dict(ckpt['scheduler_D_state_dict'])
+        start_epoch   = global_step // num_update_steps_per_epoch
+        steps_to_skip = global_step % num_update_steps_per_epoch
+        logger.info(f"已恢复到 step={global_step}（epoch={start_epoch}，本 epoch 跳过 {steps_to_skip} 步）")
+
     best_val_score = float('inf')  # composite score，越小越好
     progress_bar = tqdm(range(cfg.solver.max_train_steps),
+                        initial=global_step,
                         disable=not accelerator.is_local_main_process)
 
-    for epoch in range(num_train_epochs):
+    for epoch in range(start_epoch, num_train_epochs):
         model.train()
         gaze_mlp.train()
 
         for step, batch in enumerate(train_dataloader):
+            # 续训时跳过本 epoch 已处理过的步骤
+            if epoch == start_epoch and step < steps_to_skip:
+                continue
             if global_step >= cfg.solver.max_train_steps:
                 break
 
             with accelerator.accumulate(model, gaze_mlp):
                 # === 1. 提取配对帧数据 ===
-                source_eye_crops = batch['source_input_eye_crops'].to(weight_dtype)  # [B,6,in_h,in_w] 大范围，模型输入
-                target_eye_crops = batch['target_eye_crops'].to(weight_dtype)         # [B,6,h,w] 紧范围，监督 GT
+                source_eye_crops = batch['source_input_eye_crops'].to(weight_dtype)  # [B,3,in_h,in_w*2] 大范围，模型输入
+                target_eye_crops = batch['target_eye_crops'].to(weight_dtype)         # [B,3,h,w*2] 紧范围，监督 GT
                 target_gaze = batch['target_gaze'].to(weight_dtype)
                 target_head = batch['target_head'].to(weight_dtype)
                 source_image    = batch['source_image'].to(weight_dtype)
@@ -414,7 +491,7 @@ def main(cfg, config_file_path=None):
                 val_psnr = 0
                 val_gaze_error = 0
                 val_count = 0
-                # 保存第一个 val batch 用于可视化
+                # 随机抽取一个 val batch 用于可视化（reservoir sampling）
                 val_vis_data = None
                 with torch.no_grad():
                     for vi, vbatch in enumerate(val_dataloader):
@@ -439,10 +516,8 @@ def main(cfg, config_file_path=None):
 
                         val_l1 += F.l1_loss(gen, tgt).item()
 
-                        # LPIPS: 左右眼横向拼接 → [B, 3, h, 2w]，输入已在 [-1, 1]
-                        gen_lr = torch.cat([gen[:, :3], gen[:, 3:]], dim=3)
-                        tgt_lr = torch.cat([tgt[:, :3], tgt[:, 3:]], dim=3)
-                        val_lpips += lpips_fn(gen_lr, tgt_lr).mean().item()
+                        # LPIPS: gen/tgt 已为 [B, 3, h, 2w]（宽度拼接），直接送入
+                        val_lpips += lpips_fn(gen, tgt).mean().item()
 
                         # PSNR: 移至 [0, 2] 区间，clamp 防止模型输出略超 [-1,1]
                         val_psnr += piq_psnr(
@@ -451,15 +526,16 @@ def main(cfg, config_file_path=None):
                             data_range=2.0,
                         ).item()
 
-                        # Gaze error: 左眼 [-1,1] → [0,1] → resize 224 → ImageNet norm → estimator
-                        gen_left = (gen[:, :3].float() + 1) / 2
+                        # Gaze error: 取左眼（宽度左半部分）[-1,1] → [0,1] → resize 224 → ImageNet norm → estimator
+                        gen_left = (gen[:, :, :, :gen.shape[3]//2].float() + 1) / 2
                         gen_left = _gaze_eval_trans(gen_left)
                         gaze_pred, _ = gaze_estimator(gen_left)
                         val_gaze_error += gaze_angular_loss(tgt_gaze.float(), gaze_pred).item()
 
                         val_count += 1
 
-                        if val_vis_data is None:
+                        # Reservoir sampling: 以 1/val_count 的概率替换当前选中的 batch
+                        if random.randint(0, val_count - 1) == 0:
                             val_vis_data = {
                                 'src': src,
                                 'gen': gen,
@@ -561,7 +637,17 @@ def main(cfg, config_file_path=None):
                     'model_state_dict': unwrapped.state_dict(),
                     'gaze_mlp_state_dict': accelerator.unwrap_model(gaze_mlp).state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
+                    'lr_scheduler_state_dict': lr_scheduler.state_dict(),
                 }
+                # 判别器相关（仅在 D 已被初始化后才存入）
+                if 'eye_discriminator' in loss_dict:
+                    save_dict['discriminator_state_dict'] = (
+                        accelerator.unwrap_model(loss_dict['eye_discriminator']).state_dict())
+                    save_dict['optimizer_D_state_dict'] = (
+                        loss_dict['eye_optimizer_D'].state_dict())
+                    if 'eye_scheduler_D' in loss_dict:
+                        save_dict['scheduler_D_state_dict'] = (
+                            loss_dict['eye_scheduler_D'].state_dict())
 
                 torch.save(save_dict, ckpt_path)
                 logger.info(f"Saved checkpoint: {ckpt_path}")
