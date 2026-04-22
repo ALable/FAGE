@@ -131,7 +131,8 @@ def load_generation_model(cfg, checkpoint_path: str, device: torch.device,
     gp = cfg.model_params.gazenet_params
     gaze_mlp = MLPNetwork(num_in=gp.num_in, num_hidden=gp.num_hidden,
                           num_out=cfg.dic_unet_params.get("gaze_dim", 64),
-                          num_layers=gp.num_layers)
+                          num_layers=gp.num_layers,
+                          cross_condition=gp.get("cross_condition", False))
 
     state = torch.load(checkpoint_path, map_location="cpu")
     if "model_state_dict" in state:

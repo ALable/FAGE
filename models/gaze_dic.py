@@ -160,6 +160,8 @@ class UNetBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(emb_channels, affine_out_dim, bias=True)
         )
+        nn.init.constant_(self.affine[-1].weight, 0)
+        nn.init.constant_(self.affine[-1].bias, 0)
 
         # Norm + Conv 1
         self.norm1 = GroupNorm(out_channels, eps=eps)

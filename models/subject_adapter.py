@@ -34,15 +34,32 @@ from models.gaze_dic import GroupNorm, Downsample
 
 
 class AttentionPool(nn.Module):
-    """Attention pooling: learns where to look instead of averaging spatially."""
+    """优化后的注意力池化：空间-通道联合动态路由"""
     def __init__(self, channels: int):
         super().__init__()
-        self.attn = nn.Conv2d(channels, 1, kernel_size=1)
+        # 使用更深层的 MLP 提取注意力图
+        self.attn = nn.Sequential(
+            nn.Conv2d(channels, channels // 2, kernel_size=1),
+            nn.GELU(),
+            # 输出与 channels 数量一致的权重图，实现 per-channel 空间权重
+            nn.Conv2d(channels // 2, channels, kernel_size=1) 
+        )
+        self.norm = nn.LayerNorm(channels)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:   # [B, C, H, W]
-        w = self.attn(x).flatten(2).softmax(-1)            # [B, 1, H*W]
-        return (x.flatten(2) * w).sum(-1)                  # [B, C]
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # [B, C, H, W]
+        B, C, H, W = x.shape
+        # w: [B, C, H*W]
+        w = self.attn(x).flatten(2)
+        # 在空间维度上执行 Softmax
+        w = F.softmax(w, dim=-1)
+        
+        # x_flat: [B, C, H*W]
+        x_flat = x.flatten(2)
+        
+        # 逐通道进行空间加权求和: [B, C]
+        pooled = (x_flat * w).sum(dim=-1) 
+        
+        return self.norm(pooled)
 
 class EncoderBlock(nn.Module):
     """Unconditional UNetBlock-style block for SubjectEncoder.

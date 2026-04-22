@@ -26,13 +26,13 @@ pretrained:
 
 # Loss weights (same as Phase 1)
 loss_params:
-  l1_loss: 2.0
-  eye_l1_loss: 4.0
+  l1_loss: 10.0
+  eye_l1_loss: 200.0
   vgg_layer_weight: [5, 5, 5, 0, 0]
   pyramid_scale: [1, 0.5, 0.25]
-  eye_gan_loss: 0.3
+  eye_gan_loss: 0
   gaze_perceptual_loss: 0.01
-  start_gaze_perceptual: 0  # Start immediately for fine-tuning
+  # start_gaze_perceptual: 0  # Start immediately for fine-tuning
   id_loss: 0.1
   start_id_loss: 0  # Start immediately for fine-tuning
 
