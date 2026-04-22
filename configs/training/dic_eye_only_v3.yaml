@@ -1,0 +1,119 @@
+# FAGE Phase 1: Eye-Only Generation (v3 — architecture optimizations)
+#
+# 相较 v2 的改动：
+#   1. SubjectEncoder: GAP → AttentionPool（+128 params，保留虹膜纹理细节）
+#   2. BlockModulators: 12 独立头 → shared_proj(128→64) + 12 轻量 Linear
+#      参数量 ~350K → ~239K；共享投影引入跨块隐式正则
+#   3. UNetBlock.norm0: affine=True → False（去冗余仿射，由 AdaLN 统一承担）
+#      ⚠ 从 v2 checkpoint 续训需设 resume_strict: false
+#   4. GazeMLP: cross_condition=true（gaze 输入 concat head.detach()，联合建模）
+#   5. max_train_steps: 300000 → 400000（GAN 有更充足的训练窗口）
+#   6. gaze_perceptual_loss: 0.05 → 0.08（进一步强化注视方向约束）
+
+model_name: "FAGE"
+exp_name: "FAGE-EyeOnly-v3"
+output_dir: "/mnt/data/xhy/Logs/FAGE/logs/EyeOnly/v3"
+resume_from_checkpoint: false
+resume_strict: false          # norm0 affine 参数消失，须 strict=False 加载旧 ckpt
+seed: 42
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+data:
+  dataset_type: "gaze_hdf"
+  hdf_path: "/mnt/data/xhy/eye-concat/GazeCapture_256.h5"
+  train_bs: 16
+  num_workers: 6
+  image_size: 256
+  split_ratio: [0.8, 0.1, 0.1]
+  frame_offset_range: 8
+  max_head_diff: 0.1
+  max_target_retries: 20
+  eye_crop_size: [64, 64]
+  eye_expand_ratio: 1.5
+  input_eye_crop_size: [80, 80]
+  input_eye_expand_ratio: 2.0
+
+# ── Pretrained gaze estimator ─────────────────────────────────────────────────
+pretrained:
+  gaze_eval_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadResNet/checkpoints/latest.pth"
+  gaze_train_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadNet/checkpoints/best.pth"
+
+# ── Loss weights ──────────────────────────────────────────────────────────────
+loss_params:
+  l1_loss: 2.0
+  eye_l1_loss: 4.0
+  vgg_layer_weight: [5, 5, 5, 0, 0]
+  pyramid_scale: [1, 0.5, 0.25]
+  eye_gan_loss: 0.3
+  gaze_perceptual_loss: 0.08        # v2: 0.05 → 进一步强化注视方向约束
+  start_gaze_perceptual: 200
+  id_loss: 0.1
+  start_id_loss: 1000
+
+# ── Eye-Only UNet ─────────────────────────────────────────────────────────────
+dic_unet_params:
+  in_channels: 3
+  hidden_size: 32
+  mult_channels: [1, 2, 4, 2, 1]
+  depth: [2, 2, 4, 2, 2]
+  gaze_dim: 64
+  skip_stride: 2
+  affinef: 3
+  actfunc: 'gelu'
+  norm_type: 'gnorm'
+  num_groups: 32
+  min_channels: 4
+  dropout: 0.1
+  blockconfig: 2
+
+# ── SubjectAdapter ────────────────────────────────────────────────────────────
+subject_adapter:
+  subject_dim: 128              # encoder output dim; shared_proj → subject_dim//2=64
+
+# ── Discriminator ─────────────────────────────────────────────────────────────
+discriminator_train_params:
+  discriminator_type: 'multi-scale'
+  ndf: 64
+  lr: 1.0e-4
+  eps: 0.00000001
+  weight_decay: 0.01
+  betas: [0.5, 0.999]
+  epochs: 10000
+  start_gan: 20000
+
+# ── Model params ──────────────────────────────────────────────────────────────
+model_params:
+  gazenet_params:
+    num_layers: 6
+    num_in: 2
+    num_hidden: 256
+    cross_condition: true         # v3 新增：gaze MLP 接收 head context
+  discriminator_params:
+    scales: [1]
+    block_expansion: 32
+    max_features: 256
+    num_blocks: 3
+    sn: true
+    image_channel: 3
+
+# ── Solver ────────────────────────────────────────────────────────────────────
+solver:
+  gradient_accumulation_steps: 1
+  mixed_precision: 'no'
+  max_train_steps: 400000           # v2: 300000 → 充足的 GAN 训练窗口
+  max_grad_norm: 1.0
+  learning_rate: 1.0e-4
+  scale_lr: false
+  lr_warmup_steps: 1000
+  lr_scheduler: "cosine"
+  adam_beta1: 0.5
+  adam_beta2: 0.999
+  adam_weight_decay: 1.0e-2
+  adam_epsilon: 1.0e-8
+
+# ── Checkpointing ─────────────────────────────────────────────────────────────
+total_limit: 3
+save_model_epoch_interval: 200000
+checkpointing_steps: 5000
+val_freq: 2000
+val_batch_limit: 8

@@ -81,18 +81,19 @@ def load_phase1(cfg, checkpoint_path, device):
         num_hidden=gaze_params.num_hidden,
         num_out=gaze_dim,
         num_layers=gaze_params.num_layers,
+        cross_condition=gaze_params.get('cross_condition', False),
     )
-
     state = torch.load(checkpoint_path, map_location='cpu')
+    resume_strict = cfg.get('resume_strict', True)
     if 'unet_state_dict' in state:
-        model.eye_unet.load_state_dict(state['unet_state_dict'])
+        model.eye_unet.load_state_dict(state['unet_state_dict'], strict=resume_strict)
     elif 'model_state_dict' in state:
         model.load_state_dict(state['model_state_dict'], strict=False)
     else:
         raise KeyError(f"No model weights found. Keys: {list(state.keys())}")
 
     if 'gaze_mlp_state_dict' in state:
-        gaze_mlp.load_state_dict(state['gaze_mlp_state_dict'])
+        gaze_mlp.load_state_dict(state['gaze_mlp_state_dict'], strict=resume_strict)
 
 
     # Freeze everything
@@ -111,10 +112,11 @@ def load_phase1(cfg, checkpoint_path, device):
 def create_adapter(model, cfg, device):
     """Create a fresh SubjectAdapter (zero-init) attached to model."""
     block_channels = model._get_block_channels()
-    in_ch = cfg.dic_unet_params.get('in_channels', 6)
+    in_ch = cfg.dic_unet_params.get('in_channels', 3)
+    subject_dim = cfg.get('subject_adapter', {}).get('subject_dim', 128)
     adapter = SubjectAdapter(
         in_channels=in_ch,
-        subject_dim=128,
+        subject_dim=subject_dim,
         block_channels=block_channels,
     ).to(device)
     model.subject_adapter = adapter

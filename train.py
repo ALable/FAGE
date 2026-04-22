@@ -11,7 +11,7 @@ accelerate launch --num_processes 4 train.py --config configs/training/dic_eye_o
 """
 import os
 import random
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from tqdm.auto import tqdm
 from omegaconf import OmegaConf
 from datetime import timedelta, datetime
@@ -67,6 +67,7 @@ def create_gaze_mlp(cfg):
         num_hidden=gaze_params.num_hidden,
         num_out=gaze_dim,
         num_layers=gaze_params.num_layers,
+        cross_condition=gaze_params.get('cross_condition', False),
     )
     return gaze_mlp
 
@@ -327,8 +328,19 @@ def main(cfg, config_file_path=None):
         logger.info(f"从 checkpoint 恢复: {resume_path}")
         ckpt = torch.load(resume_path, map_location='cpu')
         global_step = ckpt.get('global_step', 0)
-        accelerator.unwrap_model(model).load_state_dict(ckpt['model_state_dict'])
-        accelerator.unwrap_model(gaze_mlp).load_state_dict(ckpt['gaze_mlp_state_dict'])
+        resume_strict = cfg.get('resume_strict', True)
+        incompatible = accelerator.unwrap_model(model).load_state_dict(
+            ckpt['model_state_dict'], strict=resume_strict)
+        if not resume_strict and (incompatible.missing_keys or incompatible.unexpected_keys):
+            logger.warning(f"  model load_state_dict (strict=False): "
+                           f"missing={incompatible.missing_keys}, "
+                           f"unexpected={incompatible.unexpected_keys}")
+        incompatible_mlp = accelerator.unwrap_model(gaze_mlp).load_state_dict(
+            ckpt['gaze_mlp_state_dict'], strict=resume_strict)
+        if not resume_strict and (incompatible_mlp.missing_keys or incompatible_mlp.unexpected_keys):
+            logger.warning(f"  gaze_mlp load_state_dict (strict=False): "
+                           f"missing={incompatible_mlp.missing_keys}, "
+                           f"unexpected={incompatible_mlp.unexpected_keys}")
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         if 'lr_scheduler_state_dict' in ckpt:
             lr_scheduler.load_state_dict(ckpt['lr_scheduler_state_dict'])
@@ -368,6 +380,7 @@ def main(cfg, config_file_path=None):
                 source_image    = batch['source_image'].to(weight_dtype)
                 target_image    = batch['target_image'].to(weight_dtype)
                 source_eye_bbox = batch['source_eye_bbox'].to(weight_dtype)
+                target_eye_bbox = batch["target_eye_bbox"].to(weight_dtype)
 
                 # === 2. Gaze embedding ===
                 head_emb, gaze_emb = gaze_mlp(target_head, target_gaze)
@@ -405,7 +418,7 @@ def main(cfg, config_file_path=None):
                 pasted = None
                 if need_pasted:
                     pasted = accelerator.unwrap_model(model).paste_eyes(
-                        generated_tight, source_image, source_eye_bbox)
+                        generated_tight, target_image, target_eye_bbox)
 
                 if cfg.loss_params.gaze_perceptual_loss > 0 and global_step >= start_perc:
                     gaze_perc_loss = loss_dict['angular_loss'](pasted, target_image)

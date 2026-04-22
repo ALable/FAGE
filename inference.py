@@ -124,9 +124,8 @@ def load_models(cfg, checkpoint_path: str, device: torch.device, with_adapter: b
         num_hidden=gaze_params.num_hidden,
         num_out=gaze_dim,
         num_layers=gaze_params.num_layers,
+        cross_condition=gaze_params.get('cross_condition', False),
     )
-
-    print(f"  Loading checkpoint: {checkpoint_path}")
     state = torch.load(checkpoint_path, map_location="cpu")
 
     if "model_state_dict" in state:

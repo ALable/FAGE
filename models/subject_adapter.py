@@ -26,10 +26,25 @@ import torch
 import torch.nn as nn
 
 
+class AttentionPool(nn.Module):
+    """Attention pooling: learns where to look instead of averaging spatially.
+
+    Replaces AdaptiveAvgPool2d(1) to preserve fine-grained texture (iris, vessels).
+    Only adds `channels` parameters (1×1 conv weight map).
+    """
+    def __init__(self, channels: int):
+        super().__init__()
+        self.attn = nn.Conv2d(channels, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:   # [B, C, H, W]
+        w = self.attn(x).flatten(2).softmax(-1)            # [B, 1, H*W]
+        return (x.flatten(2) * w).sum(-1)                  # [B, C]
+
+
 class SubjectEncoder(nn.Module):
     """Lightweight appearance encoder: source_eye → subject embedding.
 
-    4-stage conv (stride-2 × 3) + GAP + Linear + LayerNorm.
+    4-stage conv (stride-2 × 3) + AttentionPool + Linear + LayerNorm.
     Input:  [B, C_in, H, W]   (default C_in=3, H≈80, W≈160 for width-concat)
     Output: [B, subject_dim]
 
@@ -37,7 +52,7 @@ class SubjectEncoder(nn.Module):
     """
     def __init__(self, in_channels: int = 3, subject_dim: int = 128):
         super().__init__()
-        self.net = nn.Sequential(
+        self.conv_net = nn.Sequential(
             nn.Conv2d(in_channels, 16, 3, padding=1),    # [B, 16, H, W]
             nn.GELU(),
             nn.Conv2d(16, 32, 3, stride=2, padding=1),   # [B, 32, H/2, W/2]
@@ -46,14 +61,17 @@ class SubjectEncoder(nn.Module):
             nn.GELU(),
             nn.Conv2d(64, 128, 3, stride=2, padding=1),  # [B, 128, H/8, W/8]
             nn.GELU(),
-            nn.AdaptiveAvgPool2d(1),                      # [B, 128, 1, 1]
-            nn.Flatten(),                                  # [B, 128]
+        )
+        self.pool = AttentionPool(128)
+        self.proj = nn.Sequential(
             nn.Linear(128, subject_dim),
             nn.LayerNorm(subject_dim),
         )
 
     def forward(self, source_eye: torch.Tensor) -> torch.Tensor:
-        return self.net(source_eye)
+        x = self.conv_net(source_eye)   # [B, 128, H/8, W/8]
+        x = self.pool(x)                # [B, 128]
+        return self.proj(x)             # [B, subject_dim]
 
 
 class SubjectAdapter(nn.Module):
@@ -97,17 +115,20 @@ class SubjectAdapter(nn.Module):
         # ── Appearance encoder ──────────────────────────────────────────────
         self.encoder = SubjectEncoder(in_channels, subject_dim)
 
-        # ── Per-block FiLM heads ────────────────────────────────────────────
-        # Each: z_s → (scale, shift) ∈ R^{C_block}
-        # Zero-init → identity transformation at start
+        # ── Shared projection + per-block FiLM heads ───────────────────────
+        # Shared: z_s → z_shared (subject_dim → subject_dim//2), cross-block regularization
+        # Heads:  z_shared → (scale, shift) per block, no extra activation needed
+        # Zero-init heads → identity transformation at start
+        shared_dim = subject_dim // 2
+        self.shared_proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(subject_dim, shared_dim, bias=True),
+        )
         self.block_modulators = nn.ModuleList()
         for ch in block_channels:
-            head = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(subject_dim, ch * 2, bias=True),
-            )
-            nn.init.zeros_(head[-1].weight)
-            nn.init.zeros_(head[-1].bias)
+            head = nn.Linear(shared_dim, ch * 2, bias=True)
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
             self.block_modulators.append(head)
 
     # ── API ─────────────────────────────────────────────────────────────────
@@ -135,12 +156,13 @@ class SubjectAdapter(nn.Module):
         Returns:
             mods: list of (scale, shift) tuples, each shaped [B, C_block, 1, 1]
         """
+        z = self.shared_proj(subject_emb)   # [B, subject_dim//2] — shared across blocks
         mods = []
         for head in self.block_modulators:
-            params = head(subject_emb)                       # [B, 2×C]
+            params = head(z)                             # [B, 2×C]
             scale, shift = params.chunk(2, dim=1)
             mods.append((
-                scale.unsqueeze(-1).unsqueeze(-1),           # [B, C, 1, 1]
+                scale.unsqueeze(-1).unsqueeze(-1),       # [B, C, 1, 1]
                 shift.unsqueeze(-1).unsqueeze(-1),
             ))
         return mods

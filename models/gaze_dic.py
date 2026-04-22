@@ -149,8 +149,9 @@ class UNetBlock(nn.Module):
         self.skip_scale = skip_scale
         self.dropout = dropout
 
-        # Norm + Conv 0
-        self.norm0 = GroupNorm(in_channels, num_groups, min_channels, eps)
+        # Norm + Conv 0 — affine=False: AdaLN downstream owns the affine transform,
+        # removing norm0's redundant learnable scale/bias avoids triple-normalization.
+        self.norm0 = GroupNorm(in_channels, num_groups, min_channels, eps, affine=False)
         self.conv0 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
 
         # Affine (Gaze Control): gate, scale, shift
@@ -531,36 +532,39 @@ class EyeOnlyWrapper(nn.Module):
         B, _, H, W = source_image.shape
         result = source_image.clone()
         w_single = generated_eyes.shape[-1] // 2
-        left_eye  = generated_eyes[:, :, :, :w_single]
-        right_eye = generated_eyes[:, :, :, w_single:]
+        eye_crops = [generated_eyes[:, :, :, :w_single],
+                     generated_eyes[:, :, :, w_single:]]
 
         for b in range(B):
-            for eye_crop, bbox_slice in [(left_eye, slice(0, 4)), (right_eye, slice(4, 8))]:
+            for eye_idx, bbox_slice in enumerate([slice(0, 4), slice(4, 8)]):
                 x1, y1, x2, y2 = (eye_bbox[b, bbox_slice] * H).int().tolist()
                 x1, x2 = max(0, x1), min(W, x2)
                 y1, y2 = max(0, y1), min(H, y2)
                 eh, ew = y2 - y1, x2 - x1
                 if eh > 0 and ew > 0:
                     resized = F.interpolate(
-                        eye_crop[b:b+1], size=(eh, ew),
+                        eye_crops[eye_idx][b:b+1], size=(eh, ew),
                         mode='bilinear', align_corners=False
                     )[0]
                     mask = self._create_blend_mask(eh, ew, blend_margin, source_image.device)
-                    result[b, :, y1:y2, x1:x2] = mask * resized + (1 - mask) * result[b, :, y1:y2, x1:x2]
+                    result[b, :, y1:y2, x1:x2] = (
+                        mask * resized + (1 - mask) * result[b, :, y1:y2, x1:x2]
+                    )
         return result
 
     @staticmethod
     def _create_blend_mask(h, w, margin, device):
-        """创建边缘渐变混合遮罩 [1, H, W]"""
-        mask = torch.ones(1, h, w, device=device)
+        """创建边缘渐变混合遮罩 [1, H, W] — fully on-device, no Python loops."""
         if margin <= 0:
-            return mask
-        for i in range(min(margin, h // 2)):
-            alpha = (i + 1) / (margin + 1)
-            mask[:, i, :] *= alpha
-            mask[:, h - 1 - i, :] *= alpha
-        for j in range(min(margin, w // 2)):
-            alpha = (j + 1) / (margin + 1)
-            mask[:, :, j] *= alpha
-            mask[:, :, w - 1 - j] *= alpha
-        return mask
+            return torch.ones(1, h, w, device=device)
+        # ramp: 0→1 over `margin` pixels from each edge
+        def edge_ramp(size, m):
+            t = torch.ones(size, device=device)
+            if m > 0:
+                ramp = torch.linspace(1 / (m + 1), m / (m + 1), steps=min(m, size // 2), device=device)
+                t[:len(ramp)] = ramp
+                t[size - len(ramp):] = ramp.flip(0)
+            return t
+        row = edge_ramp(h, margin)   # [H]
+        col = edge_ramp(w, margin)   # [W]
+        return torch.outer(row, col).unsqueeze(0)  # [1, H, W]
