@@ -46,7 +46,7 @@ loss_params:
   pyramid_scale: [1, 0.5, 0.25]
   eye_gan_loss: 0.3
   gaze_perceptual_loss: 0.08        # v2: 0.05 → 进一步强化注视方向约束
-  start_gaze_perceptual: 200
+  start_gaze_perceptual: 100
   id_loss: 0.1
   start_id_loss: 1000
 
@@ -79,7 +79,7 @@ discriminator_train_params:
   weight_decay: 0.01
   betas: [0.5, 0.999]
   epochs: 10000
-  start_gan: 20000
+  start_gan: 2000
 
 # ── Model params ──────────────────────────────────────────────────────────────
 model_params:
@@ -113,7 +113,7 @@ solver:
 
 # ── Checkpointing ─────────────────────────────────────────────────────────────
 total_limit: 3
-save_model_epoch_interval: 200000
+save_model_epoch_interval: 2000
 checkpointing_steps: 5000
 val_freq: 2000
 val_batch_limit: 8

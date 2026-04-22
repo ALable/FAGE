@@ -5,8 +5,10 @@ Architecture separates two concerns:
   GazeControlNet (shared, ~3M, frozen after Phase 1)
     └─ handles gaze redirection via AdaLN (gaze_emb → scale/shift/gate per UNetBlock)
 
-  SubjectAdapter (per-user, ~350K, fine-tuned per new subject)
+  SubjectAdapter (per-user, ~430K, fine-tuned per new subject)
     ├─ SubjectEncoder:    source_eye → z_s [B, subject_dim]
+    │    Uses UNetBlock-style EncoderBlocks (GroupNorm + Conv + complementary-gate skip)
+    │    with Downsample layers for multi-scale feature extraction.
     └─ BlockModulators:  z_s → FiLM (scale_i, shift_i) applied in each UNetBlock
 
 FiLM injection (applied AFTER gaze gate-residual in each UNetBlock):
@@ -14,6 +16,8 @@ FiLM injection (applied AFTER gaze gate-residual in each UNetBlock):
 
 Design properties:
   - SubjectAdapter input: source eye ONLY (no gaze) → pure appearance
+  - EncoderBlocks share the same GroupNorm+Conv design language as UNetBlock
+  - Residual connections via complementary gate: gate*x + (1-gate)*skip
   - Zero-init BlockModulators → identity at init (stable Phase 1 → 2 transfer)
   - Encode reference frames once per subject, cache modulations → fast inference
 
@@ -24,14 +28,13 @@ Fast inference for new subjects:
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+from models.gaze_dic import GroupNorm, Downsample
 
 
 class AttentionPool(nn.Module):
-    """Attention pooling: learns where to look instead of averaging spatially.
-
-    Replaces AdaptiveAvgPool2d(1) to preserve fine-grained texture (iris, vessels).
-    Only adds `channels` parameters (1×1 conv weight map).
-    """
+    """Attention pooling: learns where to look instead of averaging spatially."""
     def __init__(self, channels: int):
         super().__init__()
         self.attn = nn.Conv2d(channels, 1, kernel_size=1)
@@ -41,45 +44,90 @@ class AttentionPool(nn.Module):
         return (x.flatten(2) * w).sum(-1)                  # [B, C]
 
 
+class EncoderBlock(nn.Module):
+    """Unconditional UNetBlock-style block for SubjectEncoder.
+
+    Mirrors UNetBlock's structure (GroupNorm + Conv + complementary-gate residual)
+    but removes the gaze affine branch — pure appearance feature extraction.
+
+    Residual: gate * conv_out + (1 - gate) * skip
+    where gate is learned from conv_out, ensuring bounded output.
+    """
+    def __init__(self, in_channels: int, out_channels: int, num_groups: int = 32, min_channels: int = 4):
+        super().__init__()
+        # min_channels=1 on norm0 to handle small in_channels (e.g. 3 for RGB input)
+        self.norm0 = GroupNorm(in_channels, num_groups, min_channels_per_group=1, affine=False)
+        self.conv0 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.norm1 = GroupNorm(out_channels, num_groups, min_channels)
+        self.conv1 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        # Gate: scalar per channel, sigmoid → complementary weighting
+        self.gate_proj = nn.Conv2d(out_channels, out_channels, kernel_size=1)
+        # Skip projection for channel mismatch
+        self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.skip(x) if self.skip is not None else x
+
+        # Conv first when in_channels is too small for GroupNorm (e.g. 3 < min_channels*groups)
+        h = self.conv0(self.act(self.norm0(x)))
+        h = self.conv1(self.act(self.norm1(h)))
+
+        # Complementary gate residual (same design as UNetBlock)
+        gate = torch.sigmoid(self.gate_proj(h))
+        return gate * h + (1 - gate) * residual
+
+
 class SubjectEncoder(nn.Module):
-    """Lightweight appearance encoder: source_eye → subject embedding.
+    """Multi-scale appearance encoder using UNetBlock-style EncoderBlocks.
 
-    4-stage conv (stride-2 × 3) + AttentionPool + Linear + LayerNorm.
-    Input:  [B, C_in, H, W]   (default C_in=3, H≈80, W≈160 for width-concat)
+    3-level encoder matching EyeOnlyGazeDiC channel schedule (hidden=32):
+        Level 0: [B, C_in, H,   W  ] → [B, 32, H,   W  ]  (1 block)
+        Down  0: [B, 32,   H,   W  ] → [B, 64, H/2, W/2]
+        Level 1: [B, 64,   H/2, W/2] → [B, 64, H/2, W/2]  (1 block)
+        Down  1: [B, 64,   H/2, W/2] → [B, 64, H/4, W/4]  (64 not 128, saves params)
+        Level 2: [B, 64,   H/4, W/4] → [B, 64, H/4, W/4]  (1 block)
+        AttentionPool + Linear + LayerNorm → [B, subject_dim]
+
+    Input:  [B, C_in, H, W]  (default C_in=3, H≈80, W≈160 for width-concat)
     Output: [B, subject_dim]
-
-    ~120K params (C_in=3, subject_dim=128)
     """
     def __init__(self, in_channels: int = 3, subject_dim: int = 128):
         super().__init__()
-        self.conv_net = nn.Sequential(
-            nn.Conv2d(in_channels, 16, 3, padding=1),    # [B, 16, H, W]
-            nn.GELU(),
-            nn.Conv2d(16, 32, 3, stride=2, padding=1),   # [B, 32, H/2, W/2]
-            nn.GELU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),   # [B, 64, H/4, W/4]
-            nn.GELU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),  # [B, 128, H/8, W/8]
-            nn.GELU(),
-        )
-        self.pool = AttentionPool(128)
+        self.level0 = EncoderBlock(in_channels, 32)
+        self.down0 = Downsample(32, 64)
+
+        self.level1 = EncoderBlock(64, 64)
+        self.down1 = Downsample(64, 64)   # 64→64 (not 128) to keep params ~150K
+
+        self.level2 = EncoderBlock(64, 64)
+
+        self.pool = AttentionPool(64)
         self.proj = nn.Sequential(
-            nn.Linear(128, subject_dim),
+            nn.Linear(64, subject_dim),
             nn.LayerNorm(subject_dim),
         )
 
     def forward(self, source_eye: torch.Tensor) -> torch.Tensor:
-        x = self.conv_net(source_eye)   # [B, 128, H/8, W/8]
-        x = self.pool(x)                # [B, 128]
-        return self.proj(x)             # [B, subject_dim]
+        x = self.level0(source_eye)
+        x = self.down0(x)
+        x = self.level1(x)
+        x = self.down1(x)
+        x = self.level2(x)
+        x = self.pool(x)       # [B, 64]
+        return self.proj(x)    # [B, subject_dim]
 
 
 class SubjectAdapter(nn.Module):
-    """Per-user subject appearance adapter (~350K params).
+    """Per-user subject appearance adapter (~430K params).
 
     Generates per-block FiLM modulations from source eye appearance.
     These modulate GazeControlNet's UNet blocks to preserve subject-specific
     appearance while gaze direction is controlled independently by gaze_emb.
+
+    SubjectEncoder uses UNetBlock-style EncoderBlocks with residual connections,
+    sharing the same design language (GroupNorm + Conv + complementary gate) as
+    the main UNet backbone.
 
     Training:
         Phase 1: Trained jointly with GazeControlNet (all params trainable)

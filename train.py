@@ -555,7 +555,7 @@ def main(cfg, config_file_path=None):
                                 'tgt': tgt,
                                 'src_img': vbatch['source_image'].to(weight_dtype),
                                 'tgt_img': vbatch['target_image'].to(weight_dtype),
-                                'bbox':    vbatch['source_eye_bbox'].to(weight_dtype),
+                                'bbox':    vbatch['target_eye_bbox'].to(weight_dtype),
                             }
 
                 if val_count > 0:
@@ -611,7 +611,7 @@ def main(cfg, config_file_path=None):
                 # —— TensorBoard 图像可视化（train batch）——
                 with torch.no_grad():
                     vis_pasted = accelerator.unwrap_model(model).paste_eyes(
-                        generated_tight, source_image, source_eye_bbox)
+                        generated_tight, target_image, target_eye_bbox)
                 log_vis(
                     accelerator, global_step,
                     source_eye_large=source_eye_crops,
@@ -627,7 +627,7 @@ def main(cfg, config_file_path=None):
                 if val_vis_data is not None:
                     with torch.no_grad():
                         val_pasted = accelerator.unwrap_model(model).paste_eyes(
-                            val_vis_data['gen'], val_vis_data['src_img'], val_vis_data['bbox'])
+                            val_vis_data['gen'], val_vis_data['tgt_img'], val_vis_data['bbox'])
                     log_vis(
                         accelerator, global_step,
                         source_eye_large=val_vis_data['src'],

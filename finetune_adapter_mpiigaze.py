@@ -87,11 +87,14 @@ def load_phase1(cfg, checkpoint_path, device):
         num_hidden=gaze_params.num_hidden,
         num_out=gaze_dim,
         num_layers=gaze_params.num_layers,
+        cross_condition=gaze_params.get('cross_condition', False),
     )
 
     state = torch.load(checkpoint_path, map_location='cpu')
     if 'unet_state_dict' in state:
-        model.eye_unet.load_state_dict(state['unet_state_dict'])
+        incompatible = model.eye_unet.load_state_dict(state['unet_state_dict'], strict=False)
+        if incompatible.unexpected_keys:
+            logger.warning(f"Ignoring unexpected keys (old affine norm0): {incompatible.unexpected_keys[:4]}...")
     elif 'model_state_dict' in state:
         model.load_state_dict(state['model_state_dict'], strict=False)
     else:

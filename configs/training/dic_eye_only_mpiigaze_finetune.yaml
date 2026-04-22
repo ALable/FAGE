@@ -65,9 +65,10 @@ discriminator_train_params:
 
 model_params:
   gazenet_params:
-    num_layers: 4
+    num_layers: 6
     num_in: 2
-    num_hidden: 128
+    num_hidden: 256
+    cross_condition: true
   discriminator_params:
     scales: [1]
     block_expansion: 32
