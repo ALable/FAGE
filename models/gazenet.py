@@ -2,22 +2,39 @@ import torch
 import torch.nn as nn
 
 
+import torch
+import torch.nn as nn
+
 class MLPBlock(nn.Module):
-    def __init__(self, num_layers, num_in, num_hidden, num_out=384, non_linear=nn.LeakyReLU, non_linear_last=None):
+    def __init__(self, num_layers, num_in, num_hidden, num_out=384, 
+                 non_linear=nn.GELU,
+                 use_ln=True):        
         super(MLPBlock, self).__init__()
 
         layers = []
         current_num_in = num_in
-        for _ in range(num_layers - 1):
-            layers.append(nn.Linear(current_num_in, num_hidden))
-            layers.append(non_linear())
-            current_num_in = num_hidden
-
-        layers.append(nn.Linear(current_num_in, num_out))
-        if non_linear_last is not None:
-            layers.append(non_linear_last())
+        
+        for i in range(num_layers):
+            is_last_layer = (i == num_layers - 1)
+            out_dim = num_out if is_last_layer else num_hidden
+            
+            layers.append(nn.Linear(current_num_in, out_dim))
+            if not is_last_layer:
+                if use_ln:
+                    layers.append(nn.LayerNorm(out_dim))
+                layers.append(non_linear())
+            
+            current_num_in = out_dim
 
         self.net = nn.Sequential(*layers)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         return self.net(x)

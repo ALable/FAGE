@@ -238,7 +238,7 @@ def compute_metrics(eye_tight, gt_eye, pasted_face, tgt_gaze_np,
 
 
 @torch.no_grad()
-def circle_sweep(model, gaze_mlp, src_batch, head_np, cfg, device, n=8, r=0.8):
+def circle_sweep(model, gaze_mlp, src_batch, head_np, cfg, device, n=8, r=0.3):  #0.8
     results = []
     for i in range(n):
         theta = 2 * math.pi * i / n

@@ -204,17 +204,11 @@ class UNetBlock(nn.Module):
         x = self.act1(modulate(self.norm1(x), shift, scale))
         x = self.conv1(F.dropout(x, p=self.dropout, training=self.training))
 
-        # 5. 互补门控残差连接 (凸组合，输出有界)
+        # 5. 互补门控残差连接 
         gate = torch.sigmoid(gate)
         skip_input = self.skip(orig) if self.skip is not None else orig
         x = gate * x + (1 - gate) * skip_input
 
-        # # 6. 动态通道掩码 (向后兼容)
-        # if channel_mask is not None:
-        #     x = x * channel_mask.unsqueeze(2).unsqueeze(3)
-
-        # 7. Subject FiLM modulation (主体外观保持，来自 SubjectAdapter)
-        #    x = x * (1 + scale) + shift  — 零初始化时为恒等变换
         if subject_scale is not None:
             x = x * (1 + subject_scale) + subject_shift
 
@@ -243,7 +237,64 @@ class Upsample(nn.Module):
 
 
 # ==========================================
-#  4. Eye-Only GazeDiC Model
+#  4. Head Image Encoder & Fusion
+# ==========================================
+
+class HeadImageEncoder(nn.Module):
+    """Lightweight face-image → head appearance embedding.
+
+    4× PixelUnshuffle downsampling: 256→128→64→32→16 spatial.
+    GlobalAvgPool → Linear → LayerNorm produces a fixed-size vector.
+    """
+    def __init__(self, in_channels: int = 3, base_ch: int = 32, out_dim: int = 128):
+        super().__init__()
+        self.stem = OverlapPatchEmbed(3, 1, in_channels, base_ch)
+        ch = [base_ch, base_ch * 2, base_ch * 4, base_ch * 4, base_ch * 4]
+        self.stages = nn.ModuleList()
+        for i in range(4):
+            self.stages.append(nn.Sequential(
+                Downsample(ch[i], ch[i + 1]),
+                GroupNorm(ch[i + 1]),
+                nn.GELU(),
+            ))
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.proj = nn.Sequential(
+            nn.Linear(ch[4], out_dim),
+            nn.LayerNorm(out_dim),
+        )
+
+    def forward(self, face: torch.Tensor) -> torch.Tensor:
+        """Args: face [B, 3, H, W]  Returns: [B, out_dim]"""
+        x = self.stem(face)
+        for stage in self.stages:
+            x = stage(x)
+        return self.proj(self.pool(x).flatten(1))
+
+
+class HeadCondFusion(nn.Module):
+    """Fuse head-image embedding with (optionally) head-label embedding via MLP.
+
+    label_dim=0  → image-only mode: MLP input is img_emb alone.
+    label_dim>0  → full mode: MLP input is cat([img_emb, label_emb]).
+    """
+    def __init__(self, img_dim: int, label_dim: int, out_dim: int):
+        super().__init__()
+        self.use_label = label_dim > 0
+        self.mlp = nn.Sequential(
+            nn.Linear(img_dim + label_dim, out_dim),
+            nn.SiLU(),
+            nn.Linear(out_dim, out_dim),
+            nn.LayerNorm(out_dim),
+        )
+
+    def forward(self, img_emb: torch.Tensor, label_emb: torch.Tensor = None) -> torch.Tensor:
+        """Args: img_emb [B, img_dim], label_emb [B, label_dim] (None in image-only mode)."""
+        x = torch.cat([img_emb, label_emb], dim=-1) if self.use_label else img_emb
+        return self.mlp(x)
+
+
+# ==========================================
+#  5. Eye-Only GazeDiC Model
 # ==========================================
 
 class EyeOnlyGazeDiC(nn.Module):
@@ -272,6 +323,7 @@ class EyeOnlyGazeDiC(nn.Module):
         blockconfig=2,
         actinada=1,
         init_zero=0,
+        head_dim=None,
         **kwargs
     ):
         super().__init__()
@@ -376,7 +428,21 @@ class EyeOnlyGazeDiC(nn.Module):
         # Final layer
         self.final_layer = DiCFinalLayer(channels[4], in_channels, channels[0])
 
-    def forward(self, eye_input, gaze_cond, masks=None, subject_mods=None):
+        # Head-image FiLM modulators (decoder only) — zero-init → identity at start.
+        # One Linear(head_dim, 2*C) per decoder block: outputs (scale, shift) for FiLM.
+        self.head_dec_modulators = None
+        if head_dim is not None:
+            mods = []
+            for i in range(2):          # dec stage 0, 1
+                dec_idx = i + 3
+                for _ in range(depth[dec_idx]):
+                    lin = nn.Linear(head_dim, 2 * channels[dec_idx])
+                    nn.init.zeros_(lin.weight)
+                    nn.init.zeros_(lin.bias)
+                    mods.append(lin)
+            self.head_dec_modulators = nn.ModuleList(mods)
+
+    def forward(self, eye_input, gaze_cond, masks=None, subject_mods=None, head_cond=None):
         """
         Args:
             eye_input:     [B, C_in, H, W] 源眼部 crop
@@ -384,6 +450,7 @@ class EyeOnlyGazeDiC(nn.Module):
             masks:         list of [B, C_l] 可选，向后兼容（不推荐）
             subject_mods:  list of (scale, shift) tuples，来自 SubjectAdapter
                            每个元素 shape [B, C_block, 1, 1]，共 12 个
+            head_cond:     [B, head_dim] 来自 HeadCondFusion 的头部外观条件
         Returns:
             [B, C_in, H, W] 生成的眼部图像
         """
@@ -438,6 +505,7 @@ class EyeOnlyGazeDiC(nn.Module):
 
         # Decoder
         emb_dec = [emb_enc1, emb_enc0]  # 对称: dec0 用 enc1 的 embedder, dec1 用 enc0
+        head_mod_idx = 0
 
         for i in range(2):
             x = self.ups[i](x)
@@ -447,13 +515,24 @@ class EyeOnlyGazeDiC(nn.Module):
             for block in self.dec_blocks[i]:
                 m = masks[mask_idx] if masks else None
                 ss, sh = _sub(block_idx)
+
+                # Head-image FiLM: additively compose with SubjectAdapter FiLM if both present
+                if self.head_dec_modulators is not None and head_cond is not None:
+                    h_params = self.head_dec_modulators[head_mod_idx](head_cond)
+                    h_scale, h_shift = h_params.chunk(2, dim=-1)
+                    h_scale = h_scale.unsqueeze(2).unsqueeze(3)
+                    h_shift = h_shift.unsqueeze(2).unsqueeze(3)
+                    ss = h_scale if ss is None else ss + h_scale
+                    sh = h_shift if sh is None else sh + h_shift
+                head_mod_idx += 1
+
                 x = block(x, emb_dec[i], channel_mask=m, subject_scale=ss, subject_shift=sh)
                 mask_idx += 1
                 block_idx += 1
 
-        # Final layer
-        output = self.final_layer(x, emb_enc0)
-        return output
+        # Residual prediction: model outputs ΔI, final = source + ΔI
+        delta = self.final_layer(x, emb_enc0)
+        return torch.clamp(eye_input + delta, min=-1.0, max=1.0)
 
 
 class EyeOnlyWrapper(nn.Module):
@@ -468,6 +547,29 @@ class EyeOnlyWrapper(nn.Module):
     """
     def __init__(self, unet_config, subject_adapter_config=None):
         super().__init__()
+
+        # Head image encoder branch (optional)
+        # Reads: head_img_encoder (bool), head_img_dim (int), head_fusion_dim (int)
+        head_dim = None
+        self.head_encoder = None
+        self.head_fusion   = None
+        if unet_config.get('head_img_encoder', False):
+            head_img_dim    = unet_config.get('head_img_dim', 128)
+            head_fusion_dim = unet_config.get('head_fusion_dim', 128)
+            gaze_dim        = unet_config.get('gaze_dim', 64)
+            head_img_only   = unet_config.get('head_img_only', False)
+            self.head_encoder = HeadImageEncoder(
+                in_channels=unet_config.get('in_channels', 3),
+                base_ch=32,
+                out_dim=head_img_dim,
+            )
+            self.head_fusion = HeadCondFusion(
+                img_dim=head_img_dim,
+                label_dim=0 if head_img_only else gaze_dim,
+                out_dim=head_fusion_dim,
+            )
+            head_dim = head_fusion_dim
+
         self.eye_unet = EyeOnlyGazeDiC(
             in_channels=unet_config.get('in_channels', 3),
             hidden_size=unet_config.get('hidden_size', 32),
@@ -479,6 +581,7 @@ class EyeOnlyWrapper(nn.Module):
             actfunc=unet_config.get('actfunc', 'gelu'),
             dropout=unet_config.get('dropout', 0.1),
             blockconfig=unet_config.get('blockconfig', 2),
+            head_dim=head_dim,
         )
 
         # SubjectAdapter: 主体外观保持模块（Phase 2 个性化时只训练此模块）
@@ -505,11 +608,13 @@ class EyeOnlyWrapper(nn.Module):
                 channels.append(block.out_channels)
         return channels
 
-    def forward(self, source_eye_crops, encoder_hidden_states):
+    def forward(self, source_eye_crops, encoder_hidden_states, source_face=None):
         """
         Args:
             source_eye_crops:       [B, C_in, H, W] 源眼部 crop
             encoder_hidden_states:  [B, 2, gaze_dim] 给 UNet 的 gaze 条件
+                                    [:,0,:] = head_emb, [:,1,:] = gaze_emb
+            source_face:            [B, 3, 256, 256] 可选，用于 HeadImageEncoder
         Returns:
             generated_eyes: [B, C_in, H, W]
         """
@@ -517,8 +622,14 @@ class EyeOnlyWrapper(nn.Module):
         if self.subject_adapter is not None:
             subject_mods = self.subject_adapter(source_eye_crops)
 
+        head_cond = None
+        if self.head_encoder is not None and source_face is not None:
+            head_img_emb   = self.head_encoder(source_face)                  # [B, head_img_dim]
+            head_label_emb = encoder_hidden_states[:, 0, :]                  # [B, gaze_dim]
+            head_cond      = self.head_fusion(head_img_emb, head_label_emb)  # [B, head_fusion_dim]
+
         return self.eye_unet(source_eye_crops, encoder_hidden_states,
-                             subject_mods=subject_mods)
+                             subject_mods=subject_mods, head_cond=head_cond)
 
     def paste_eyes(self, generated_eyes, source_image, eye_bbox, blend_margin=4):
         """推理时将生成的眼睛贴回原图

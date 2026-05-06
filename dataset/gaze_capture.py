@@ -5,6 +5,8 @@ FAGE — Paired Frame Dataset for Eye-Only Gaze Generation
 返回配对帧: source 提供眼部外观, target 提供 gaze 方向和 GT。
 """
 import os
+import math
+import multiprocessing
 import torch
 import numpy as np
 from torch.utils.data import Dataset
@@ -40,7 +42,11 @@ class HDFDataset(Dataset):
                  pick_at_least_per_person=2,
                  max_head_diff=None,
                  min_gaze_diff=None,
-                 max_target_retries=10):
+                 max_target_retries=10,
+                 curriculum_max_gaze_diff_start=None,
+                 curriculum_max_gaze_diff_end=None,
+                 curriculum_start_step=0,
+                 curriculum_end_step=50000):
         """
         Args:
             hdf_file_path: HDF5 文件路径
@@ -56,6 +62,10 @@ class HDFDataset(Dataset):
             max_head_diff: 头姿差异上限 (rad)，超过则重新选取 target；None=不过滤
             min_gaze_diff: 注视差异下限 (rad)，在满足头姿条件的候选中优先选差异大的；None=随机选
             max_target_retries: 过滤时最多尝试的候选帧数（从全片段随机采样）
+            curriculum_max_gaze_diff_start: 课程学习起始 gaze diff 上限 (rad)；None=关闭课程学习
+            curriculum_max_gaze_diff_end: 课程学习终止 gaze diff 上限；None=最终无限制
+            curriculum_start_step: 课程学习开始 step
+            curriculum_end_step: 课程学习结束 step（到达终止上限）
         """
         assert os.path.isfile(hdf_file_path), f"HDF5 not found: {hdf_file_path}"
         self.hdf_path = hdf_file_path
@@ -65,6 +75,18 @@ class HDFDataset(Dataset):
         self.max_head_diff       = max_head_diff
         self.min_gaze_diff       = min_gaze_diff
         self.max_target_retries  = max_target_retries
+
+        # Curriculum learning: gaze diff upper bound grows from start → end over training
+        self._curriculum_enabled = curriculum_max_gaze_diff_start is not None
+        self._curriculum_start_limit = float(curriculum_max_gaze_diff_start) if self._curriculum_enabled else None
+        self._curriculum_end_limit   = float(curriculum_max_gaze_diff_end) if curriculum_max_gaze_diff_end is not None else None
+        self._curriculum_start_step  = curriculum_start_step
+        self._curriculum_end_step    = curriculum_end_step
+        # Shared-memory float so DataLoader workers (forked on Linux) see live updates
+        if self._curriculum_enabled:
+            self._curriculum_limit = multiprocessing.Value('d', float(curriculum_max_gaze_diff_start))
+        else:
+            self._curriculum_limit = None
         self.eye_crop_size = eye_crop_size
         self.eye_expand_ratio = eye_expand_ratio
         # 模型输入尺寸（比监督尺寸更大，默认与监督相同退化）
@@ -136,6 +158,33 @@ class HDFDataset(Dataset):
 
     def __len__(self):
         return len(self.index_to_query)
+
+    def set_curriculum_step(self, step: int):
+        """Update gaze-diff budget based on current training step.
+
+        Linearly interpolates max_gaze_diff from start_limit → end_limit
+        over [curriculum_start_step, curriculum_end_step].
+        Call from the main training process; visible to forked workers via shared memory.
+        """
+        if not self._curriculum_enabled:
+            return
+        s, e = self._curriculum_start_step, self._curriculum_end_step
+        start_lim = self._curriculum_start_limit
+        end_lim   = self._curriculum_end_limit  # None means "no limit"
+
+        if step <= s:
+            limit = start_lim
+        elif step >= e:
+            limit = end_lim if end_lim is not None else math.inf
+        else:
+            t = (step - s) / (e - s)
+            if end_lim is None:
+                # Linearly increase to a large practical value (~115° ≈ 2.0 rad)
+                limit = start_lim + t * (2.0 - start_lim)
+            else:
+                limit = start_lim + t * (end_lim - start_lim)
+
+        self._curriculum_limit.value = limit
 
     def _crop_eyes(self, image_np, face_parsing):
         """裁剪左右眼，同时返回 input（大范围）和 target（紧范围）两套 crop

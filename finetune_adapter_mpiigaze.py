@@ -490,11 +490,8 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--lpips_weight", type=float, default=0.1)
     parser.add_argument("--gan_weight", type=float, default=0.1)
     parser.add_argument("--id_weight", type=float, default=0.1)
-    parser.add_argument("--lpips_size", type=int, nargs=2, default=[128, 128],
-                        metavar=("H", "W"))
     parser.add_argument("--pretrain_steps", type=int, default=0,
                         help="Pre-train adapter on val set (0=disabled)")
     parser.add_argument("--pretrain_lr", type=float, default=5e-5)
@@ -504,12 +501,16 @@ def main():
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
-    args.lpips_size = tuple(args.lpips_size)
 
     seed_everything(args.seed)
     device = torch.device(args.device)
 
     cfg = OmegaConf.load(args.config)
+
+    # Read lpips config from yaml loss_params
+    lp = cfg.get("loss_params", {})
+    args.lpips_weight = float(lp.get("lpips_loss", 0.0))
+    args.lpips_size = tuple(lp.get("lpips_size", [128, 128]))
 
     adapter_dir = os.path.join(args.output_dir, "adapters")
     tb_dir = os.path.join(args.output_dir, "tensorboard")

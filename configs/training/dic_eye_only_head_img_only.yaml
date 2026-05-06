@@ -1,6 +1,14 @@
-# FAGE Phase 1: Eye-Only Generation (共享预训练)
+# FAGE Ablation: Head-Image-Only Conditioning (no head label)
+#
+# 实验目的: 对比 head_image + head_label (baseline) vs. 仅 head_image
+#   - 去除 HeadCondFusion 中的 head_label 输入
+#   - 仅保留 HeadImageEncoder → [B, 128] 视觉外观向量注入 decoder FiLM
+#   - 若指标接近 baseline → 说明图像编码器已隐式学到头姿信息，label 冗余
+#   - 若指标下降       → 说明 label 提供了图像无法替代的参数化头姿信息
+#
+# 与 dic_eye_only.yaml 唯一区别: head_img_only: true (+ 独立 exp_name / output_dir)
 model_name: "FAGE"
-exp_name: "FAGE-HeadAid"
+exp_name: "FAGE-HeadImgOnly"
 output_dir: "/mnt/data/xhy/Logs/FAGE/logs/EyeOnly/5-3"
 resume_from_checkpoint: False
 seed: 42
@@ -14,8 +22,8 @@ data:
   image_size: 256
   split_ratio: [0.8, 0.1, 0.1]
   frame_offset_range: 8
-  max_head_diff: 0.1        # 头姿差异上限 (rad, ~5.7°)；None 关闭过滤
-  max_target_retries: 20    # 候选帧数上限（frame_offset_range 扩大后可适当减小）
+  max_head_diff: 0.1
+  max_target_retries: 20
   eye_crop_size: [64, 64]
   eye_expand_ratio: 1.5
   input_eye_crop_size: [80, 80]
@@ -53,10 +61,11 @@ dic_unet_params:
   min_channels: 4
   dropout: 0.1
   blockconfig: 2
-  # Head image encoder branch
+  # Head image encoder branch (image-only ablation)
   head_img_encoder: true
-  head_img_dim: 128       # HeadImageEncoder output dim
-  head_fusion_dim: 128    # HeadCondFusion output dim (= head_dim injected into decoder)
+  head_img_only: true        # ← ablation key: disable head label in HeadCondFusion
+  head_img_dim: 128          # HeadImageEncoder output dim
+  head_fusion_dim: 128       # HeadCondFusion output dim (MLP input = 128, no label concat)
 
 # Discriminator (for eye crops)
 discriminator_train_params:

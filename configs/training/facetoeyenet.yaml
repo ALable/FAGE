@@ -1,0 +1,104 @@
+# FAGE FaceToEyeNet: Asymmetric Face→Eye Generation
+#
+# 输入: [B, 3, 256, 256] 全脸图像
+# 输出: [B, 3, 64, 128]  双眼 width-concat
+# 结构: 重型编码器 (4 级下采样) + 长宽比瓶颈 + 轻量级解码器 (3 级上采样)
+#
+# 与 EyeOnly 系列的主要区别:
+#   - 输入为全脸而非眼部 crop，让网络自己学习眼部定位
+#   - 无 SubjectAdapter (全脸输入已蕴含身份信息)
+#   - 训练 loop 中无需 center-crop 步骤
+
+model_name: "FaceToEyeNet"
+exp_name: "FAGE-FaceToEyeNet-v1"
+output_dir: "/mnt/data/xhy/Logs/FAGE/logs/FaceToEyeNet/v1"
+resume_from_checkpoint: false
+seed: 42
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+data:
+  dataset_type: "gaze_hdf"
+  hdf_path: "/mnt/data/xhy/eye-concat/GazeCapture_256.h5"
+  train_bs: 16
+  num_workers: 6
+  image_size: 256
+  split_ratio: [0.8, 0.1, 0.1]
+  frame_offset_range: 8
+  max_head_diff: 0.1
+  max_target_retries: 20
+  eye_crop_size: [64, 64]        # target GT size (used for loss supervision)
+  eye_expand_ratio: 1.5
+  input_eye_crop_size: [80, 80]  # for visualization comparison only (not model input)
+  input_eye_expand_ratio: 2.0
+
+# ── Pretrained gaze estimator ─────────────────────────────────────────────────
+pretrained:
+  gaze_eval_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadResNet/checkpoints/latest.pth"
+  gaze_train_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadNet/checkpoints/best.pth"
+
+# ── Loss weights ──────────────────────────────────────────────────────────────
+loss_params:
+  l1_loss: 2.0
+  eye_l1_loss: 4.0
+  vgg_layer_weight: [5, 5, 5, 0, 0]
+  pyramid_scale: [1, 0.5, 0.25]
+  eye_gan_loss: 0.3
+  gaze_perceptual_loss: 0.08
+  start_gaze_perceptual: 100
+  id_loss: 0.1
+  start_id_loss: 1000
+
+# ── FaceToEyeNet model ────────────────────────────────────────────────────────
+facetoeyenet_params:
+  in_channels: 3
+  hidden_size: 64        # base channels: enc_channels = [64, 128, 256, 256, 512]
+  gaze_dim: 64
+  actfunc: 'gelu'
+  norm_type: 'gnorm'
+
+# ── Discriminator ─────────────────────────────────────────────────────────────
+discriminator_train_params:
+  discriminator_type: 'multi-scale'
+  ndf: 64
+  lr: 1.0e-4
+  eps: 0.00000001
+  weight_decay: 0.01
+  betas: [0.5, 0.999]
+  epochs: 10000
+  start_gan: 2000
+
+# ── Model params ──────────────────────────────────────────────────────────────
+model_params:
+  gazenet_params:
+    num_layers: 6
+    num_in: 2
+    num_hidden: 256
+    cross_condition: true
+  discriminator_params:
+    scales: [1]
+    block_expansion: 32
+    max_features: 256
+    num_blocks: 3
+    sn: true
+    image_channel: 3
+
+# ── Solver ────────────────────────────────────────────────────────────────────
+solver:
+  gradient_accumulation_steps: 1
+  mixed_precision: 'no'
+  max_train_steps: 100000
+  max_grad_norm: 1.0
+  learning_rate: 1.0e-4
+  scale_lr: false
+  lr_warmup_steps: 1000
+  lr_scheduler: "cosine"
+  adam_beta1: 0.5
+  adam_beta2: 0.999
+  adam_weight_decay: 1.0e-2
+  adam_epsilon: 1.0e-8
+
+# ── Checkpointing ─────────────────────────────────────────────────────────────
+total_limit: 3
+checkpointing_steps: 5000
+val_freq: 2000
+val_batch_limit: 8
