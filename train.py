@@ -119,6 +119,21 @@ def _eye_to_grid(eye_tensor, n=4):
     return make_grid(imgs, nrow=n, padding=2)
 
 
+def resolve_experiment_dir(cfg):
+    """Resolve the experiment directory, optionally using the auto log layout."""
+    if not cfg.get('auto_log_dir', False):
+        return f"{cfg.output_dir}/{cfg.exp_name}"
+
+    base_dir = cfg.get('output_dir', "/mnt/data/xhy/Logs")
+    project_name = cfg.get('project_name', cfg.get('model_name', 'FAGE'))
+    model_name = cfg.get('model_name', cfg.exp_name)
+    run_time = datetime.now().strftime("%m:%d:%H:%M")
+    epoch_num = cfg.solver.get('num_train_epochs', cfg.solver.max_train_steps)
+    learning_rate = cfg.solver.learning_rate
+    run_name = f"{model_name}-{run_time}-epoch-{epoch_num}-{learning_rate}"
+    return os.path.join(base_dir, project_name, run_name)
+
+
 def log_vis(accelerator, global_step, source_eye_large, generated_tight,
             target_eye_crops, source_image, target_image, pasted_face, n=4,
             prefix="train"):
@@ -167,8 +182,10 @@ def log_vis(accelerator, global_step, source_eye_large, generated_tight,
 
 def main(cfg, config_file_path=None):
     exp_name = cfg.exp_name
-    save_dir = f"{cfg.output_dir}/{exp_name}"
+    save_dir = resolve_experiment_dir(cfg)
     os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "samples"), exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "tensorboard"), exist_ok=True)
 
     # Save config
     if config_file_path and os.path.exists(config_file_path):

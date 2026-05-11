@@ -1,7 +1,9 @@
 # PGMA Phase 1: personalized gaze-memory eye generation
 model_name: "PGMA"
+project_name: "FAGE"
 exp_name: "PGMA-EyeOnly"
-output_dir: "/mnt/data/xhy/Logs/FAGE"
+output_dir: "/mnt/data/xhy/Logs"
+auto_log_dir: true
 resume_from_checkpoint: false
 resume_strict: false
 seed: 42

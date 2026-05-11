@@ -10,7 +10,6 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from models.gaze_dic import Downsample, GroupNorm
 

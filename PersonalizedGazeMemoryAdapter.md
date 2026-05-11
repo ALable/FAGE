@@ -78,8 +78,8 @@ appearance across many target gazes.
 ## Validation checklist
 
 ```bash
-python -m py_compile models/personalized_gaze_adapter.py models/gaze_dic.py
-python - <<'PY'
+python3 -m py_compile models/personalized_gaze_adapter.py models/gaze_dic.py
+python3 - <<'PY'
 import torch
 from models.gaze_dic import EyeOnlyWrapper
 
