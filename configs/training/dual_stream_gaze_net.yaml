@@ -1,0 +1,126 @@
+# DualStreamGazeNet Phase 1: Joint Pre-training
+#
+# New architecture highlights:
+#   1. Dual-stream: AppearanceEncoder (identity) + GazeTransformDecoder (redirection)
+#   2. Cross-attention fusion: decoder queries attend to appearance features
+#   3. Delta-gaze conditioning: Δgaze = target - source for natural redirection
+#   4. Sinusoidal positional encoding of angular inputs for smooth interpolation
+#   5. PersonalizationHead: attention-bias injection for per-user adaptation (~200K)
+#   6. Gaze-appearance disentanglement: appearance stream sees no gaze signal
+#
+# Training compared to FAGE-EyeOnly-v3:
+#   - Uses source_gaze + target_gaze + head_pose (not just target angles)
+#   - Cross-attention adds ~15% compute vs pure FiLM, but better identity preservation
+#   - Compatible with same GazeCapture HDF5 dataset and loss stack
+
+model_name: "DualStreamGazeNet"
+exp_name: "DualStream-v1"
+output_dir: "/mnt/data/xhy/Logs/DualStreamGazeNet/logs/v1"
+resume_from_checkpoint: false
+resume_strict: true
+seed: 42
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+data:
+  dataset_type: "gaze_hdf"
+  hdf_path: "/mnt/data/xhy/eye-concat/GazeCapture_256.h5"
+  train_bs: 16
+  num_workers: 6
+  image_size: 256
+  split_ratio: [0.8, 0.1, 0.1]
+  frame_offset_range: 8
+  max_head_diff: 0.1
+  max_target_retries: 20
+  eye_crop_size: [64, 64]
+  eye_expand_ratio: 1.5
+  input_eye_crop_size: [80, 80]
+  input_eye_expand_ratio: 2.0
+
+# ── Pretrained gaze estimator ─────────────────────────────────────────────────
+pretrained:
+  gaze_eval_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadResNet/checkpoints/latest.pth"
+  gaze_train_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadNet/checkpoints/best.pth"
+
+# ── Loss weights ──────────────────────────────────────────────────────────────
+loss_params:
+  l1_loss: 2.0
+  eye_l1_loss: 4.0
+  vgg_layer_weight: [5, 5, 5, 0, 0]
+  pyramid_scale: [1, 0.5, 0.25]
+  eye_gan_loss: 0.3
+  gaze_perceptual_loss: 0.08
+  start_gaze_perceptual: 100
+  id_loss: 0.1
+  start_id_loss: 1000
+  # Delta-gaze consistency: encourage Δ=0 → identity mapping
+  delta_zero_loss: 0.5
+  start_delta_zero: 500
+
+# ── DualStreamGazeNet model params ────────────────────────────────────────────
+dual_stream_params:
+  in_channels: 3
+  hidden_size: 32
+  mult_channels: [1, 2, 4, 2, 1]
+  depth: [2, 2, 4, 2, 2]
+  gaze_dim: 64
+  num_heads: 4
+  affinef: 3
+  actfunc: 'gelu'
+  dropout: 0.1
+  blockconfig: 2
+  # Appearance encoder
+  app_mult: [1, 2, 4]
+  app_depth: [2, 2, 2]
+  # Cross-attention at decoder levels 0 and 1
+  cross_attn_levels: [0, 1]
+  # Delta-gaze embedder
+  freq_bands: 8
+  gaze_hidden_dim: 256
+  # Personalization
+  personalization:
+    enabled: true
+    identity_dim: 128
+    unet_film: false    # enable for SubjectAdapter-style FiLM on top of cross-attn
+
+# ── Discriminator ─────────────────────────────────────────────────────────────
+discriminator_train_params:
+  discriminator_type: 'multi-scale'
+  ndf: 64
+  lr: 1.0e-4
+  eps: 0.00000001
+  weight_decay: 0.01
+  betas: [0.5, 0.999]
+  epochs: 10000
+  start_gan: 2000
+
+# ── Discriminator architecture ────────────────────────────────────────────────
+model_params:
+  discriminator_params:
+    scales: [1]
+    block_expansion: 32
+    max_features: 256
+    num_blocks: 3
+    sn: true
+    image_channel: 3
+
+# ── Solver ────────────────────────────────────────────────────────────────────
+solver:
+  gradient_accumulation_steps: 1
+  mixed_precision: 'no'
+  max_train_steps: 400000
+  max_grad_norm: 1.0
+  learning_rate: 1.0e-4
+  scale_lr: false
+  lr_warmup_steps: 1000
+  lr_scheduler: "cosine"
+  adam_beta1: 0.5
+  adam_beta2: 0.999
+  adam_weight_decay: 1.0e-2
+  adam_epsilon: 1.0e-8
+
+# ── Checkpointing ─────────────────────────────────────────────────────────────
+total_limit: 3
+save_model_epoch_interval: 2000
+checkpointing_steps: 5000
+val_freq: 2000
+val_batch_limit: 8
