@@ -1,0 +1,121 @@
+# PersonaGazeNet — Personalised Gaze Redirection
+#
+# 三阶段课程训练:
+#   phase1 : encoder + decoder + gaze_mlp (no refs)        80K steps
+#   phase2 : + ref_tokenizer + RFA gates                   60K steps
+#   phase3 : + HyperLoRA                                   60K steps
+#
+# Reference architecture: see PersonaGazeNet.md
+
+model_name: "PersonaGazeNet"
+exp_name: "PGN-v1"
+output_dir: "/mnt/data/xhy/Logs/FAGE/logs/PersonaGazeNet/v1"
+resume_from_checkpoint: false
+seed: 42
+
+# Training phase: one of 'phase1', 'phase2', 'phase3'.
+# Change between consecutive runs (resume_from_checkpoint each time) for the
+# 3-stage curriculum. For initial smoke runs, start at phase1.
+phase: "phase1"
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+data:
+  dataset_type: "gaze_hdf"
+  hdf_path: "/mnt/data/xhy/eye-concat/GazeCapture_256.h5"
+  train_bs: 16
+  num_workers: 6
+  image_size: 256
+  split_ratio: [0.8, 0.1, 0.1]
+  frame_offset_range: 12
+  max_head_diff: 0.1                # rad
+  max_head_diff_ref: 0.15           # slightly looser for the ref set
+  max_target_retries: 20
+  eye_crop_size: [64, 64]           # tight, used as model input & GT
+  eye_expand_ratio: 1.5
+  input_eye_crop_size: [80, 80]     # for vis only
+  input_eye_expand_ratio: 2.0
+  # Reference frames (multi-ref dataset only)
+  ref_K: 4                          # K used when phase ≠ phase1
+  ref_K_choices: [1, 4, 8]          # phase3 randomises K from this list
+
+# ── Pretrained gaze estimator (for gaze perceptual loss) ─────────────────────
+pretrained:
+  gaze_eval_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadResNet/checkpoints/latest.pth"
+  gaze_train_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadNet/checkpoints/best.pth"
+
+# ── Loss weights ─────────────────────────────────────────────────────────────
+loss_params:
+  l1_loss: 2.0
+  eye_l1_loss: 4.0
+  vgg_layer_weight: [5, 5, 5, 0, 0]
+  pyramid_scale: [1, 0.5, 0.25]
+  eye_gan_loss: 0.3
+  gaze_perceptual_loss: 0.08
+  start_gaze_perceptual: 2000
+  id_loss: 0.1
+  start_id_loss: 4000
+  # PGN-specific:
+  cycle_loss: 0.5                   # Identity-anchored cycle (Phase 2/3 only)
+  start_cycle_loss: 20000
+  whitening_loss: 1.0e-3            # gaze/head decorrelation
+
+# ── PersonaGazeNet model ─────────────────────────────────────────────────────
+pgn_params:
+  in_channels: 3
+  hidden_size: 32
+  mult_channels: [1, 2, 4]
+  enc_depth: [2, 2, 4]
+  dec_depth: [2, 2]
+  gaze_dim: 64
+  token_dim: 128
+  ref_base_ch: 32
+  lora_rank: 8
+  use_hyper_lora: true              # set false for phase1 if you want exact-baseline parity
+  dropout: 0.1
+
+# ── Gaze MLP ──────────────────────────────────────────────────────────────────
+model_params:
+  gazenet_params:
+    num_layers: 6
+    num_in: 2
+    num_hidden: 256
+    cross_condition: true
+  discriminator_params:
+    scales: [1]
+    block_expansion: 32
+    max_features: 256
+    num_blocks: 3
+    sn: true
+    image_channel: 3
+
+# ── Discriminator (eye-crop PatchGAN) ────────────────────────────────────────
+discriminator_train_params:
+  discriminator_type: 'multi-scale'
+  ndf: 64
+  lr: 1.0e-4
+  eps: 0.00000001
+  weight_decay: 0.01
+  betas: [0.5, 0.999]
+  epochs: 10000
+  start_gan: 30000
+
+# ── Solver ───────────────────────────────────────────────────────────────────
+solver:
+  gradient_accumulation_steps: 1
+  mixed_precision: 'no'
+  max_train_steps: 80000            # phase1 default; raise for phase2/3
+  max_grad_norm: 1.0
+  learning_rate: 1.0e-4
+  scale_lr: false
+  lr_warmup_steps: 1000
+  lr_scheduler: "cosine"
+  adam_beta1: 0.5
+  adam_beta2: 0.999
+  adam_weight_decay: 1.0e-2
+  adam_epsilon: 1.0e-8
+
+# ── Checkpointing ────────────────────────────────────────────────────────────
+total_limit: 3
+checkpointing_steps: 5000
+val_freq: 2000
+val_batch_limit: 8
