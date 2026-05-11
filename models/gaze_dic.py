@@ -584,6 +584,20 @@ class EyeOnlyWrapper(nn.Module):
             head_dim=head_dim,
         )
 
+        self.personalized_adapter = None
+        if unet_config.get('personalized_gaze_adapter', False):
+            from models.personalized_gaze_adapter import PersonalizedGazeAdapter
+            self.personalized_adapter = PersonalizedGazeAdapter(
+                in_channels=unet_config.get('in_channels', 3),
+                gaze_dim=unet_config.get('gaze_dim', 64),
+                block_channels=self._get_block_channels(),
+                token_dim=unet_config.get('pgma_token_dim', 128),
+                base_channels=unet_config.get('pgma_base_channels', 32),
+                token_grid=unet_config.get('pgma_token_grid', [2, 4]),
+                num_heads=unet_config.get('pgma_num_heads', 4),
+                dropout=unet_config.get('pgma_dropout', 0.0),
+            )
+
         # SubjectAdapter: 主体外观保持模块（Phase 2 个性化时只训练此模块）
         self.subject_adapter = None
         if subject_adapter_config is not None:
@@ -593,6 +607,20 @@ class EyeOnlyWrapper(nn.Module):
                 subject_dim=subject_adapter_config.get('subject_dim', 128),
                 block_channels=self._get_block_channels(),
             )
+
+    @staticmethod
+    def _compose_modulations(base_mods, extra_mods):
+        """Add two modulation lists while preserving the SubjectAdapter API."""
+        if base_mods is None:
+            return extra_mods
+        if extra_mods is None:
+            return base_mods
+        if len(base_mods) != len(extra_mods):
+            raise ValueError(f"Modulation length mismatch: {len(base_mods)} vs {len(extra_mods)}")
+        composed = []
+        for (base_scale, base_shift), (extra_scale, extra_shift) in zip(base_mods, extra_mods):
+            composed.append((base_scale + extra_scale, base_shift + extra_shift))
+        return composed
 
     def _get_block_channels(self):
         """从 UNet 结构自动推导每个 block 的输出通道数"""
@@ -620,7 +648,14 @@ class EyeOnlyWrapper(nn.Module):
         """
         subject_mods = None
         if self.subject_adapter is not None:
-            subject_mods = self.subject_adapter(source_eye_crops)
+            if getattr(self.subject_adapter, 'requires_gaze', False):
+                subject_mods = self.subject_adapter(source_eye_crops, encoder_hidden_states)
+            else:
+                subject_mods = self.subject_adapter(source_eye_crops)
+
+        if self.personalized_adapter is not None:
+            pgma_mods = self.personalized_adapter(source_eye_crops, encoder_hidden_states)
+            subject_mods = self._compose_modulations(subject_mods, pgma_mods)
 
         head_cond = None
         if self.head_encoder is not None and source_face is not None:
