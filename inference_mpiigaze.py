@@ -122,10 +122,12 @@ def vstack(imgs, gap: int = 4) -> np.ndarray:
 def load_generation_model(cfg, checkpoint_path: str, device: torch.device,
                           with_adapter: bool = False):
     unet_config = OmegaConf.to_container(cfg.dic_unet_params, resolve=True)
-    subject_adapter_config = (
-        {'in_channels': unet_config.get('in_channels', 6), 'subject_dim': 128}
-        if with_adapter else None
-    )
+    subject_adapter_config = None
+    if with_adapter:
+        if 'subject_adapter_params' in cfg and cfg.subject_adapter_params is not None:
+            subject_adapter_config = OmegaConf.to_container(cfg.subject_adapter_params, resolve=True)
+        else:
+            subject_adapter_config = {'in_channels': unet_config.get('in_channels', 6), 'subject_dim': 128}
     model = EyeOnlyWrapper(unet_config, subject_adapter_config=subject_adapter_config)
 
     gp = cfg.model_params.gazenet_params

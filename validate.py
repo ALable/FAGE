@@ -109,7 +109,10 @@ def find_best_checkpoint(save_dir: str) -> str:
 
 def build_models(cfg, ckpt_path: str, device: torch.device):
     unet_config = OmegaConf.to_container(cfg.dic_unet_params, resolve=True)
-    model = EyeOnlyWrapper(unet_config).to(device)
+    subject_adapter_config = None
+    if 'subject_adapter_params' in cfg and cfg.subject_adapter_params is not None:
+        subject_adapter_config = OmegaConf.to_container(cfg.subject_adapter_params, resolve=True)
+    model = EyeOnlyWrapper(unet_config, subject_adapter_config=subject_adapter_config).to(device)
 
     gp = cfg.model_params.gazenet_params
     gaze_dim = cfg.dic_unet_params.get("gaze_dim", 64)

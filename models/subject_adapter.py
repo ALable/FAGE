@@ -248,3 +248,165 @@ class SubjectAdapter(nn.Module):
 
     def num_trainable_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class GazeAwareSubjectAdapter(nn.Module):
+    """Subject adapter that conditions personalization on the target gaze.
+
+    The original SubjectAdapter is appearance-only: it encodes a source eye crop
+    and emits per-block FiLM parameters. This variant keeps the same zero-init
+    FiLM contract but builds the modulation vector from subject appearance,
+    target head embedding, target gaze embedding, and their interactions.
+
+    This makes the adapter a compact research path for personalized gaze
+    redirection: per-user eye geometry can influence how strongly each UNet
+    block should rotate iris/eyelid features for a specific target gaze.
+    """
+
+    requires_gaze_condition = True
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        subject_dim: int = 128,
+        gaze_dim: int = 64,
+        hidden_dim: int = 128,
+        block_channels=None,
+        dropout: float = 0.0,
+    ):
+        """
+        Args:
+            in_channels: eye crop input channels.
+            subject_dim: output dimension of the subject encoder.
+            gaze_dim: dimension of head/gaze embeddings from GazeMLP.
+            hidden_dim: shared modulation dimension.
+            block_channels: output channels for each UNetBlock.
+            dropout: dropout in the subject-gaze fusion MLP.
+        """
+        super().__init__()
+        self.subject_dim = subject_dim
+        self.gaze_dim = gaze_dim
+        self.hidden_dim = hidden_dim
+
+        if block_channels is None:
+            block_channels = [32] * 2 + [64] * 2 + [128] * 4 + [64] * 2 + [32] * 2
+
+        self.encoder = SubjectEncoder(in_channels, subject_dim)
+
+        self.subject_proj = nn.Sequential(
+            nn.Linear(subject_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.head_proj = nn.Sequential(
+            nn.Linear(gaze_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.gaze_proj = nn.Sequential(
+            nn.Linear(gaze_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.delta_proj = nn.Sequential(
+            nn.Linear(gaze_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+
+        fusion_dim = hidden_dim * 6
+        self.context_mlp = nn.Sequential(
+            nn.Linear(fusion_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.context_gate = nn.Sequential(
+            nn.Linear(fusion_dim, hidden_dim),
+            nn.Sigmoid(),
+        )
+        self.context_norm = nn.LayerNorm(hidden_dim)
+
+        self.block_modulators = nn.ModuleList()
+        for ch in block_channels:
+            head = nn.Linear(hidden_dim, ch * 2, bias=True)
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+            self.block_modulators.append(head)
+
+    @staticmethod
+    def _split_gaze_condition(gaze_condition: torch.Tensor):
+        """Return head and gaze embeddings from [B, 2, D] or [B, D]."""
+        if gaze_condition.dim() == 3 and gaze_condition.shape[1] == 2:
+            return gaze_condition[:, 0, :], gaze_condition[:, 1, :]
+        if gaze_condition.dim() == 2:
+            return torch.zeros_like(gaze_condition), gaze_condition
+        raise ValueError(
+            "gaze_condition must have shape [B, 2, gaze_dim] or [B, gaze_dim]"
+        )
+
+    def encode(self, source_eye: torch.Tensor) -> torch.Tensor:
+        """Encode one or more reference eye crops into a subject embedding.
+
+        Args:
+            source_eye: [B, C, H, W] or [B, R, C, H, W].
+        Returns:
+            subject_emb: [B, subject_dim].
+        """
+        if source_eye.dim() == 5:
+            bsz, refs, channels, height, width = source_eye.shape
+            flat = source_eye.reshape(bsz * refs, channels, height, width)
+            emb = self.encoder(flat).reshape(bsz, refs, -1)
+            return emb.mean(dim=1)
+        return self.encoder(source_eye)
+
+    def fuse_context(
+        self,
+        subject_emb: torch.Tensor,
+        gaze_condition: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse subject and target gaze context into a modulation vector."""
+        head_emb, gaze_emb = self._split_gaze_condition(gaze_condition)
+        subject_feat = self.subject_proj(subject_emb)
+        head_feat = self.head_proj(head_emb)
+        gaze_feat = self.gaze_proj(gaze_emb)
+        delta_feat = self.delta_proj(gaze_emb - head_emb)
+
+        fusion = torch.cat(
+            [
+                subject_feat,
+                head_feat,
+                gaze_feat,
+                delta_feat,
+                subject_feat * gaze_feat,
+                subject_feat * delta_feat,
+            ],
+            dim=-1,
+        )
+        candidate = self.context_mlp(fusion)
+        gate = self.context_gate(fusion)
+        return self.context_norm(subject_feat + gate * candidate)
+
+    def get_modulations(
+        self,
+        subject_emb: torch.Tensor,
+        gaze_condition: torch.Tensor,
+    ):
+        """Generate per-block FiLM parameters conditioned on subject and gaze."""
+        z = self.fuse_context(subject_emb, gaze_condition)
+        mods = []
+        for head in self.block_modulators:
+            params = head(z)
+            scale, shift = params.chunk(2, dim=1)
+            mods.append((
+                scale.unsqueeze(-1).unsqueeze(-1),
+                shift.unsqueeze(-1).unsqueeze(-1),
+            ))
+        return mods
+
+    def forward(self, source_eye: torch.Tensor, gaze_condition: torch.Tensor):
+        """Return gaze-aware per-block FiLM modulations."""
+        return self.get_modulations(self.encode(source_eye), gaze_condition)
+
+    @property
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    def num_trainable_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)

@@ -54,7 +54,10 @@ def seed_everything(seed):
 
 def create_model(cfg):
     unet_config = OmegaConf.to_container(cfg.dic_unet_params, resolve=True)
-    model = EyeOnlyWrapper(unet_config)
+    subject_adapter_config = None
+    if 'subject_adapter_params' in cfg and cfg.subject_adapter_params is not None:
+        subject_adapter_config = OmegaConf.to_container(cfg.subject_adapter_params, resolve=True)
+    model = EyeOnlyWrapper(unet_config, subject_adapter_config=subject_adapter_config)
     return model
 
 
@@ -106,8 +109,12 @@ def _get_tb_writer(accelerator):
 
 
 def _denorm(t):
-    """[-1,1] → [0,1]，clamp 防止越界"""
-    return (t * 0.5 + 0.5).clamp(0, 1)
+    """Map image tensors to [0, 1] for TensorBoard without hard clipping."""
+    img = t.float() * 0.5 + 0.5
+    reduce_dims = tuple(range(1, img.dim()))
+    img_min = img.amin(dim=reduce_dims, keepdim=True)
+    img_max = img.amax(dim=reduce_dims, keepdim=True)
+    return (img - img_min) / (img_max - img_min + 1e-8)
 
 
 def _eye_to_grid(eye_tensor, n=4):

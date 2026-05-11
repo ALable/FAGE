@@ -113,7 +113,10 @@ def load_models(cfg, checkpoint_path: str, device: torch.device, with_adapter: b
 
     subject_adapter_config = None
     if with_adapter:
-        subject_adapter_config = {'in_channels': unet_config.get('in_channels', 6), 'subject_dim': 128}
+        if 'subject_adapter_params' in cfg and cfg.subject_adapter_params is not None:
+            subject_adapter_config = OmegaConf.to_container(cfg.subject_adapter_params, resolve=True)
+        else:
+            subject_adapter_config = {'in_channels': unet_config.get('in_channels', 6), 'subject_dim': 128}
 
     model = EyeOnlyWrapper(unet_config, subject_adapter_config=subject_adapter_config)
 

@@ -53,7 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.gaze_dic import EyeOnlyWrapper
 from models.gazenet import MLPNetwork
-from models.subject_adapter import SubjectAdapter
+from models.subject_adapter import GazeAwareSubjectAdapter, SubjectAdapter
 from dataset.gaze_capture import HDFDataset
 import h5py
 from loss.basic_loss import IDLoss, discriminator_loss, generator_loss
@@ -117,16 +117,48 @@ def load_phase1(cfg, checkpoint_path, device):
 
 
 def create_adapter(model, cfg, device):
-    """Create a fresh SubjectAdapter (zero-init) attached to model."""
+    """Create a fresh subject adapter (zero-init) attached to model."""
     block_channels = model._get_block_channels()
-    in_ch = cfg.dic_unet_params.get('in_channels', 6)
-    adapter = SubjectAdapter(
-        in_channels=in_ch,
-        subject_dim=128,
+    adapter_cfg = {}
+    if 'subject_adapter_params' in cfg and cfg.subject_adapter_params is not None:
+        adapter_cfg = OmegaConf.to_container(cfg.subject_adapter_params, resolve=True)
+
+    method = adapter_cfg.get('method', 'film')
+    common_kwargs = dict(
+        in_channels=adapter_cfg.get('in_channels', cfg.dic_unet_params.get('in_channels', 6)),
+        subject_dim=adapter_cfg.get('subject_dim', 128),
         block_channels=block_channels,
-    ).to(device)
+    )
+    if method in ('gaze_aware', 'pgra'):
+        adapter = GazeAwareSubjectAdapter(
+            **common_kwargs,
+            gaze_dim=adapter_cfg.get('gaze_dim', cfg.dic_unet_params.get('gaze_dim', 64)),
+            hidden_dim=adapter_cfg.get('hidden_dim', 128),
+            dropout=adapter_cfg.get('dropout', 0.0),
+        ).to(device)
+    elif method in ('film', 'subject_film'):
+        adapter = SubjectAdapter(**common_kwargs).to(device)
+    else:
+        raise ValueError(f"Unknown subject adapter method: {method}")
     model.subject_adapter = adapter
     return adapter
+
+
+def create_adapter_optimizer(adapter, lr, weight_decay):
+    """Use a stronger LR for modulation heads while still training fusion layers."""
+    encoder_params = list(adapter.encoder.parameters())
+    adapter_params = [
+        param for name, param in adapter.named_parameters()
+        if not name.startswith('encoder.')
+    ]
+    return torch.optim.AdamW(
+        [
+            {'params': encoder_params, 'lr': lr},
+            {'params': adapter_params, 'lr': lr * 5},
+        ],
+        betas=(0.9, 0.999),
+        weight_decay=weight_decay,
+    )
 
 
 def get_all_subject_keys(cfg) -> list:
@@ -216,13 +248,7 @@ def pretrain_adapter_on_val(model, gaze_mlp, cfg, device, args, lpips_fn=None, w
         pin_memory=True, drop_last=True,
     )
 
-    optimizer = torch.optim.AdamW(
-        [
-            {'params': adapter.encoder.parameters(),          'lr': args.pretrain_lr},
-            {'params': adapter.block_modulators.parameters(), 'lr': args.pretrain_lr * 5},
-        ],
-        betas=(0.9, 0.999), weight_decay=args.weight_decay,
-    )
+    optimizer = create_adapter_optimizer(adapter, args.pretrain_lr, args.weight_decay)
     lr_sched = get_scheduler(
         "cosine", optimizer=optimizer,
         num_warmup_steps=min(100, args.pretrain_steps // 10),
@@ -359,14 +385,7 @@ def finetune_one_subject(
         pin_memory=True, drop_last=len(train_ds) > args.batch_size,
     )
 
-    optimizer = torch.optim.AdamW(
-        [
-            {'params': adapter.encoder.parameters(),          'lr': args.lr},
-            {'params': adapter.block_modulators.parameters(), 'lr': args.lr * 5},
-        ],
-        betas=(0.9, 0.999),
-        weight_decay=args.weight_decay,
-    )
+    optimizer = create_adapter_optimizer(adapter, args.lr, args.weight_decay)
 
     lr_sched = get_scheduler(
         "cosine",

@@ -587,12 +587,25 @@ class EyeOnlyWrapper(nn.Module):
         # SubjectAdapter: 主体外观保持模块（Phase 2 个性化时只训练此模块）
         self.subject_adapter = None
         if subject_adapter_config is not None:
-            from models.subject_adapter import SubjectAdapter
-            self.subject_adapter = SubjectAdapter(
-                in_channels=subject_adapter_config.get('in_channels', 3),
+            adapter_method = subject_adapter_config.get('method', 'film')
+            adapter_kwargs = dict(
+                in_channels=subject_adapter_config.get('in_channels', unet_config.get('in_channels', 3)),
                 subject_dim=subject_adapter_config.get('subject_dim', 128),
                 block_channels=self._get_block_channels(),
             )
+            if adapter_method in ('gaze_aware', 'pgra'):
+                from models.subject_adapter import GazeAwareSubjectAdapter
+                self.subject_adapter = GazeAwareSubjectAdapter(
+                    **adapter_kwargs,
+                    gaze_dim=subject_adapter_config.get('gaze_dim', unet_config.get('gaze_dim', 64)),
+                    hidden_dim=subject_adapter_config.get('hidden_dim', 128),
+                    dropout=subject_adapter_config.get('dropout', 0.0),
+                )
+            elif adapter_method in ('film', 'subject_film'):
+                from models.subject_adapter import SubjectAdapter
+                self.subject_adapter = SubjectAdapter(**adapter_kwargs)
+            else:
+                raise ValueError(f"Unknown subject adapter method: {adapter_method}")
 
     def _get_block_channels(self):
         """从 UNet 结构自动推导每个 block 的输出通道数"""
@@ -620,7 +633,10 @@ class EyeOnlyWrapper(nn.Module):
         """
         subject_mods = None
         if self.subject_adapter is not None:
-            subject_mods = self.subject_adapter(source_eye_crops)
+            if getattr(self.subject_adapter, 'requires_gaze_condition', False):
+                subject_mods = self.subject_adapter(source_eye_crops, encoder_hidden_states)
+            else:
+                subject_mods = self.subject_adapter(source_eye_crops)
 
         head_cond = None
         if self.head_encoder is not None and source_face is not None:
