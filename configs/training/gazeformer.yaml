@@ -1,0 +1,132 @@
+# GazeFormer: Hybrid CNN-Transformer for Personalized Gaze Redirection
+# Phase 1: Shared Pretraining (all users)
+#
+# Architecture highlights:
+#   - Transformer blocks at ½ and ¼ resolution with gaze cross-attention
+#   - Identity token encoder for spatially-adaptive personalization
+#   - ConvBlocks at full resolution for efficiency
+#   - Residual prediction: output = clamp(source + delta)
+#
+# Launch:
+#   accelerate launch --num_processes 4 train_gazeformer.py --config configs/training/gazeformer.yaml
+
+model_name: "GazeFormer"
+exp_name: "GazeFormer-Phase1"
+output_dir: "/mnt/data/xhy/Logs/GazeFormer/logs/Phase1"
+resume_from_checkpoint: False
+seed: 42
+
+# ==========================
+# Data
+# ==========================
+data:
+  dataset_type: "gaze_hdf"
+  hdf_path: "/mnt/data/xhy/eye-concat/GazeCapture_256.h5"
+  train_bs: 16
+  num_workers: 6
+  image_size: 256
+  split_ratio: [0.8, 0.1, 0.1]
+  frame_offset_range: 8
+  max_head_diff: 0.1
+  max_target_retries: 20
+  eye_crop_size: [64, 64]
+  eye_expand_ratio: 1.5
+  input_eye_crop_size: [80, 80]
+  input_eye_expand_ratio: 2.0
+
+# ==========================
+# Pretrained Gaze Estimators (for loss computation & evaluation)
+# ==========================
+pretrained:
+  gaze_eval_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadResNet/checkpoints/latest.pth"
+  gaze_train_checkpoint_path: "/home/xuhy/PycharmProjects/Unet-Gaze/.logs/checkpoints/gazecapture_256_eye_concat/GazeHeadNet/checkpoints/best.pth"
+
+# ==========================
+# Loss Weights
+# ==========================
+loss_params:
+  l1_loss: 2.0
+  eye_l1_loss: 4.0
+  vgg_layer_weight: [5, 5, 5, 0, 0]
+  pyramid_scale: [1, 0.5, 0.25]
+  eye_gan_loss: 0.3
+  gaze_perceptual_loss: 0.01
+  start_gaze_perceptual: 500
+  id_loss: 0.1
+  start_id_loss: 1000
+
+# ==========================
+# GazeFormer Architecture
+# ==========================
+gazeformer_params:
+  in_channels: 3
+  hidden_size: 32
+  mult_channels: [1, 2, 4, 2, 1]     # channels = hidden_size × mult → [32, 64, 128, 64, 32]
+  depth: [2, 1, 4, 1, 2]              # conv-only, conv+tf, bottleneck-tf, conv+tf, conv-only
+  gaze_dim: 64
+  num_heads: [2, 4, 8, 4, 2]          # only stages 1,2,3 actually use attention
+  window_size: 8                       # self-attention window at ½ resolution
+  mlp_ratio: 3.0                       # ConvFFN expansion ratio
+  num_gaze_tokens: 4                   # extra learnable gaze tokens per stage
+  identity_token_dim: 128              # dimension of identity tokens
+  num_identity_tokens: 8               # tokens from IdentityTokenEncoder
+  dropout: 0.1
+
+# Identity Token Encoder (for personalization)
+identity_encoder_params:
+  in_channels: 3
+  token_dim: 128                       # must match identity_token_dim above
+  num_tokens: 8                        # must match num_identity_tokens above
+
+# ==========================
+# Discriminator (for eye crops)
+# ==========================
+discriminator_train_params:
+  discriminator_type: 'multi-scale'
+  ndf: 64
+  lr: 1.0e-4
+  eps: 0.00000001
+  weight_decay: 0.01
+  betas: [0.5, 0.999]
+  epochs: 10000
+  start_gan: 3000
+
+model_params:
+  gazenet_params:
+    num_layers: 4
+    num_in: 2
+    num_hidden: 128
+    cross_condition: false
+  discriminator_params:
+    scales: [1]
+    block_expansion: 32
+    max_features: 256
+    num_blocks: 3
+    sn: True
+    image_channel: 3
+
+# ==========================
+# Solver
+# ==========================
+solver:
+  gradient_accumulation_steps: 1
+  mixed_precision: 'no'
+  max_train_steps: 200000
+  max_grad_norm: 1.0
+  learning_rate: 2.0e-4                # slightly higher LR for transformer warmup
+  scale_lr: False
+  lr_warmup_steps: 1000               # longer warmup for attention layers
+  lr_scheduler: "cosine"
+  adam_beta1: 0.9                      # standard β₁ for transformers (vs 0.5 in UNet config)
+  adam_beta2: 0.999
+  adam_weight_decay: 1.0e-2
+  adam_epsilon: 1.0e-8
+
+# ==========================
+# Checkpointing & Validation
+# ==========================
+total_limit: 3
+save_model_epoch_interval: 200000
+checkpointing_steps: 5000
+val_freq: 20000
+val_batch_limit: 8
